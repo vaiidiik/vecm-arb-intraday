@@ -12,11 +12,14 @@ TRADING_DAYS_PER_YEAR = 252
 PERIODS_PER_YEAR = BARS_PER_DAY * TRADING_DAYS_PER_YEAR
 
 LOOKBACK = 200 * BARS_PER_DAY
-MAX_HOLDING_BARS = 25 * BARS_PER_DAY
 TREND_WINDOW = 21 * BARS_PER_DAY
 
-ENTRY_THRESHOLD = 1.5
+ENTRY_THRESHOLD = 1.4
 ZERO_RANK_GRACE = 5
+
+EXIT_CRITICAL_IDX = 0
+COINT_INVALID_STREAK_REQUIRED = 1
+STABILITY_WINDOW = 10 * BARS_PER_DAY
 
 
 def _borrow_rates(assets, adv, vols, periods_per_year=PERIODS_PER_YEAR):
@@ -47,7 +50,7 @@ class VECMStrategyEngine:
             significance=0.01,
             entry_threshold=ENTRY_THRESHOLD,
             min_kappa=2.0,
-            max_kappa=50.0,
+            max_kappa=150.0,
             delay_span=5,
             k_ar_diff=7,
             periods_per_year=PERIODS_PER_YEAR,
@@ -60,15 +63,13 @@ class VECMStrategyEngine:
             exit_threshold=0.2,
             short_exit_threshold=0.2,
             long_exit_threshold=0.2,
-            turnover_penalty=0.010,
+            turnover_penalty=0.0005,
             max_leverage=3.0,
             max_weight_per_asset=0.80,
             target_fraction=1.0,
-            max_holding_days=MAX_HOLDING_BARS,
-            stop_loss_pct=0.08,
-            trailing_stop_pct=0.05,
             volatility_threshold=0.35,
-            trend_threshold=0.50,
+            trend_threshold=0.65,
+            capital_per_trade_frac=1.0
         )
         self.backtester = PortfolioBacktester(
             initial_capital=initial_capital, gamma=impact_gamma,
@@ -80,6 +81,10 @@ class VECMStrategyEngine:
         self._w_prev = np.zeros(self.N)
         self._zero_rank_days = 0
         self._prev_z_score = 0.0
+        self._zscore_history = []
+        self._active_pair = None
+        self._active_beta = None
+        self._invalid_streak = 0
 
     def _process_tick(self, timestamp, current_prices, current_adv, current_vols):
         self._historical_prices.append(current_prices.copy())
@@ -100,92 +105,121 @@ class VECMStrategyEngine:
         rank = 0
         w_new = np.zeros(self.N)
 
-        log_window_hist = log_window[:-1]
-        rank, beta_set = self.math_engine.cointegrate(log_window_hist)
+        # Generate signals using the same flow as the backtester
+        cached_signals = self.math_engine.generate_all_signals(log_window, self.N)
 
-        if rank > 0:
+        SPREAD_WINDOW = 20 * BARS_PER_DAY
+        spread_start = max(0, len(log_window) - SPREAD_WINDOW)
+        log_recent = log_window[spread_start:]
+
+        live_signals = []
+        for sig in cached_signals:
+            bv = sig["beta_full"]
+            spread = log_recent @ bv
+            if len(spread) < 20:
+                continue
+            z, mu, sigma = self.math_engine.compute_spread_z(spread, lookback=SPREAD_WINDOW)
+            rsi_arr = self.math_engine.compute_rsi(spread)
+            rsi = float(rsi_arr[-1]) if len(rsi_arr) > 0 else 50.0
+            _, _, macd_hist = self.math_engine.compute_macd(spread)
+
+            halflife_sig = sig.get("halflife", 50.0)
+            live_signals.append({
+                "z": z,
+                "sigma": sigma,
+                "halflife": halflife_sig,
+                "beta_full": bv,
+                "rsi": rsi,
+                "macd_hist": macd_hist,
+                "pair": sig.get("pair"),
+                "rank": sig.get("rank", 1),
+                "score": abs(z) / max(halflife_sig, 1.0),
+            })
+
+        live_signals.sort(key=lambda x: x["score"], reverse=True)
+
+        if live_signals:
+            z_score = live_signals[0]["z"]
+            rank = live_signals[0]["rank"]
             self._zero_rank_days = 0
-            z_score, kappa, beta, rsi_val = self.math_engine.calculate_sscore(
-                log_window[-1], beta_set, log_window_hist
+        else:
+            z_score = 0.0
+            rank = 0
+            self._zero_rank_days += 1
+
+        gross_exp = np.abs(self._w_prev).sum()
+
+        if gross_exp > 0.01:
+            pnl_since_entry = self.backtester.position_pnl_sum() / self.backtester.capital if self.backtester.capital > 0 else 0.0
+            holding_bars = max([self.backtester.days - d for d in self.backtester.entry_day.values()], default=0)
+        else:
+            pnl_since_entry = 0.0
+            holding_bars = 0
+
+        coint_invalid = False
+        if gross_exp > 0.01 and holding_bars > 0 and holding_bars % BARS_PER_DAY == 0:
+            if self._active_pair is not None:
+                pair_lp = log_window[:, list(self._active_pair)]
+                pair_beta = self._active_beta[list(self._active_pair)] if self._active_beta is not None else None
+                rank_check, _, _, _ = self.math_engine.cointegrate(pair_lp, critical_idx_override=EXIT_CRITICAL_IDX)
+                rank_failed = (rank_check == 0)
+                stability_ok = self.math_engine.check_cointegration_stability(pair_lp, pair_beta, window=STABILITY_WINDOW)
+            else:
+                full_rank, _, _, _ = self.math_engine.cointegrate(log_window, critical_idx_override=EXIT_CRITICAL_IDX)
+                rank_failed = (full_rank == 0)
+                stability_ok = self.math_engine.check_cointegration_stability(log_window, self._active_beta, window=STABILITY_WINDOW)
+
+            if not stability_ok:
+                self._invalid_streak = COINT_INVALID_STREAK_REQUIRED
+            elif rank_failed:
+                self._invalid_streak += 1
+            else:
+                self._invalid_streak = 0
+
+            coint_invalid = self._invalid_streak >= COINT_INVALID_STREAK_REQUIRED
+        elif gross_exp <= 0.01:
+            self._invalid_streak = 0
+
+        # Use the top signal's halflife for holding cap calculation if flat, or keep it 50
+        active_halflife = live_signals[0].get("halflife", 50.0) if live_signals else 50.0
+
+        force_exit = False
+        if gross_exp > 0.01:
+            force_exit = self.risk_engine.check_forced_exit(
+                self._w_prev, holding_bars, halflife=active_halflife, coint_invalid=coint_invalid,
+                pnl_since_entry=pnl_since_entry
             )
 
-            stable = self.math_engine.check_cointegration_stability(
-                log_window, beta, window=10
-            )
-            if not stable:
-                w_new = np.zeros(self.N)
-            elif beta is not None and kappa > 0.0 and abs(z_score) <= 5.0:
+        w_new = self._w_prev.copy()
+
+        if force_exit and gross_exp > 0.01:
+            w_new = np.zeros(self.N)
+        elif gross_exp > 0.01 and abs(z_score) < self.risk_engine.long_exit_threshold:
+            w_new = np.zeros(self.N)
+        elif self._zero_rank_days > ZERO_RANK_GRACE and gross_exp > 0.01:
+            w_new = np.zeros(self.N)
+        elif gross_exp < 0.01 and live_signals and abs(z_score) >= ENTRY_THRESHOLD:
+            alpha = self.risk_engine.compute_alpha(live_signals, self.N, current_position=self._w_prev)
+
+            if np.abs(alpha).max() > 1e-10:
                 signal_returns = np.diff(log_window, axis=0)
                 cov_matrix = np.cov(signal_returns.T)
+                shrinkage = 0.2
+                cov_matrix = (1 - shrinkage) * cov_matrix + shrinkage * np.diag(np.diag(cov_matrix))
+                cov_matrix = (cov_matrix + cov_matrix.T) / 2.0
+                cov_matrix += 1e-7 * np.eye(self.N)
 
-                n_ret = len(self._historical_returns)
-                market_vol = (
-                    np.std(self._historical_returns[-TREND_WINDOW:-1]) if n_ret >= TREND_WINDOW else 0.0
-                )
-                trend_strength = (
-                    np.mean(self._historical_returns[-TREND_WINDOW:-1]) * 20
-                    if n_ret >= TREND_WINDOW else 0.0
-                )
-                position_holding_days = (
-                    max(
-                        self.backtester.days - d
-                        for d in self.backtester.entry_day.values()
-                    )
-                    if self.backtester.entry_day else 0
-                )
+                w_new = self.risk_engine.optimize(alpha, cov_matrix, self._w_prev, current_adv, current_vols)
 
-                current_exposure = float(np.sum(np.abs(self._w_prev)))
-                pnl_since_entry_now = (
-                    self.backtester.position_pnl_sum() / self.backtester.capital
-                    if self.backtester.capital > 0 else 0.0
-                )
-                risk_breach = (
-                    position_holding_days >= self.risk_engine.max_holding_days
-                    or pnl_since_entry_now < -self.risk_engine.stop_loss_pct
-                    or pnl_since_entry_now < -self.risk_engine.trailing_stop_pct
-                )
-                needs_rebalance = False
-
-                if current_exposure < 1e-4 and abs(z_score) >= ENTRY_THRESHOLD:
-                    needs_rebalance = True
-                elif (
-                    current_exposure > 1e-4
-                    and (abs(z_score - self._prev_z_score) > 0.50 or risk_breach)
-                ):
-                    needs_rebalance = True
-                elif current_exposure > 1e-4:
-                    w_new = self._w_prev.copy()
-
-                if needs_rebalance:
-                    w_new = self.risk_engine.optimise_weights(
-                        w_prev=self._w_prev,
-                        cov_matrix=cov_matrix,
-                        beta=beta,
-                        z_score=z_score,
-                        rsi=rsi_val,
-                        adv=current_adv,
-                        vols=current_vols,
-                        borrow_rates=borrow_rates,
-                        kappa=kappa,
-                        holding_days=position_holding_days,
-                        pnl_since_entry=(
-                            self.backtester.position_pnl_sum()
-                            / self.backtester.capital
-                        ),
-                        market_vol=market_vol,
-                        trend_strength=trend_strength,
-                        rank=rank,
-                        capital=self.backtester.capital,
-                    )
-
-            self._prev_z_score = z_score
-
-        else:
-            self._zero_rank_days += 1
-            if self._zero_rank_days <= ZERO_RANK_GRACE and np.sum(np.abs(self._w_prev)) > 1e-4:
-                w_new = self._w_prev.copy()
-            else:
-                w_new = np.zeros(self.N)
+        new_gross = np.abs(w_new).sum()
+        if gross_exp < 0.01 and new_gross > 0.01:
+            self._active_pair = live_signals[0].get("pair") if live_signals else None
+            self._active_beta = live_signals[0].get("beta_full") if live_signals else None
+            self._invalid_streak = 0
+        elif new_gross < 0.01:
+            self._active_pair = None
+            self._active_beta = None
+            self._invalid_streak = 0
 
         self.backtester.process_day(
             date=timestamp,
