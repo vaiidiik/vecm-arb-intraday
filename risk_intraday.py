@@ -2,24 +2,25 @@ import numpy as np
 import cvxpy as cp
 import logging
 
+
 class dynamic_risk_engine:
-    def __init__(self, num_assets, aum, maker_taker_fee=0.0004, gamma=0.10,
+    def __init__(self, num_assets, aum, gamma=0.05,
                  entry_threshold=1.5,
-                 exit_threshold=0.0,
-                 short_exit_threshold=0.0,
+                 exit_threshold=0.3,
+                 short_exit_threshold=0.3,
                  long_exit_threshold=None,
-                 max_leverage=3.0,
+                 max_leverage=1.5,
                  target_fraction=0.8,
-                 max_weight_per_asset=0.50,
-                 turnover_penalty=0.010,
-                 max_holding_days=15,
-                 stop_loss_pct=0.08,
-                 trailing_stop_pct=0.05,
-                 volatility_threshold=0.35,
-                 trend_threshold=0.50):
+                 max_weight_per_asset=0.45,
+                 turnover_penalty=0.0005,
+                 volatility_threshold=0.50,
+                 trend_threshold=0.30,
+                 periods_per_year=6804,
+                 capital_per_trade_frac=0.20,
+                 stale_loss_holding_bars=55,
+                 stale_loss_threshold=-0.01):
         self.N = num_assets
         self.aum = aum
-        self.fee_rate = maker_taker_fee
         self.gamma = gamma
         self.entry_threshold = entry_threshold
         self.long_exit_threshold = exit_threshold if long_exit_threshold is None else long_exit_threshold
@@ -28,156 +29,160 @@ class dynamic_risk_engine:
         self.target_fraction = target_fraction
         self.max_weight_per_asset = max_weight_per_asset
         self.turnover_penalty = turnover_penalty
-        self.max_holding_days = max_holding_days
-        self.stop_loss_pct = stop_loss_pct
-        self.trailing_stop_pct = trailing_stop_pct
         self.volatility_threshold = volatility_threshold
         self.trend_threshold = trend_threshold
+        self.periods_per_year = periods_per_year
+        self.capital_per_trade_frac = capital_per_trade_frac
+        self.stale_loss_holding_bars = stale_loss_holding_bars
+        self.stale_loss_threshold = stale_loss_threshold
         self.logger = logging.getLogger("VECM_ARB.Risk")
-        self.rank_position_scale = {1: 1.0, 2: 0.8, 3: 0.6}
 
-    def _side_capacity(self):
-        return min(self.max_leverage / 2.0, self.max_weight_per_asset * self.N / 2.0)
+    def compute_alpha(self, signals, n_assets, current_position=None):
+        alpha = np.zeros(n_assets)
+        if not signals:
+            return alpha
 
-    def _allocate_side(self, beta, descending=True):
-        order = np.argsort(beta)
-        if descending:
-            order = order[::-1]
-        remaining = self._side_capacity()
-        value = 0.0
-        for idx in order:
-            amount = min(self.max_weight_per_asset, remaining)
-            value += amount * beta[idx]
-            remaining -= amount
-            if remaining <= 1e-12:
-                break
-        return value
+        best = signals[0]
+        z = best["z"]
+        beta = best["beta_full"]
+        rsi = best.get("rsi", 50.0)
+        macd_hist = best.get("macd_hist", 0.0)
+        halflife = best.get("halflife", 50.0)
 
-    def _exposure_cap(self, beta):
-        beta = np.asarray(beta, dtype=float)
-        long_value = self._allocate_side(beta, descending=True)
-        short_value = self._allocate_side(beta, descending=False)
-        return max(long_value - short_value, 0.0)
+        if abs(z) < self.long_exit_threshold:
+            return alpha
 
-    def _current_state(self, w_prev, beta, cap):
-        if cap <= 1e-12: return 0
-        exposure = float(np.dot(w_prev, beta))
-        if exposure > 0.25 * cap: return 1
-        if exposure < -0.25 * cap: return -1
-        return 0
+        if abs(z) < self.entry_threshold:
+            return alpha
 
-    def _compute_target_exposure(self, s_score, w_prev, beta, rsi, holding_days, pnl_since_entry):
-        cap = self._exposure_cap(beta)
-        if cap <= 1e-12: return 0.0
+        macd_confirmed = False
+        if z > self.entry_threshold and macd_hist < 0:
+            macd_confirmed = True
+        elif z < -self.entry_threshold and macd_hist > 0:
+            macd_confirmed = True
 
-        if holding_days >= self.max_holding_days:
-            return 0.0
+        if not macd_confirmed:
+            return alpha
 
-        if pnl_since_entry < -self.stop_loss_pct:
-            return 0.0
+        hl_scale = min(2.0, max(0.3, 50.0 / max(halflife, 1.0)))
 
-        if pnl_since_entry < -self.trailing_stop_pct:
-            return 0.0
+        rsi_boost = 1.0
+        if z > 0 and rsi > 60:
+            rsi_boost = 1.0 + min((rsi - 60) / 80.0, 0.3)
+        elif z < 0 and rsi < 40:
+            rsi_boost = 1.0 + min((40 - rsi) / 80.0, 0.3)
 
-        target = self.target_fraction * cap
-        state = self._current_state(w_prev, beta, cap)
+        direction = -np.sign(z)
+        magnitude = min(abs(z) / 3.0, 1.0) * hl_scale * rsi_boost
 
-        if state == 0:
-            if s_score <= -self.entry_threshold:
-                return target
-            if s_score >= self.entry_threshold:
-                return -target
-            return 0.0
+        # NOTE: previously this also multiplied by self.capital_per_trade_frac.
+        # That double-counted the capital allocation: eff_leverage/eff_max_wt
+        # in optimize() (and _fallback_allocation()) ALREADY scale the position
+        # limits by capital_per_trade_frac. Scaling alpha down by the same
+        # factor here shrank the optimizer's expected-return term relative to
+        # the risk penalty, so the solver never pushed weights anywhere near
+        # the (already-reduced) leverage cap. Result: realized gross exposure
+        # averaged ~8% of capital instead of the ~30%+ the config intended.
+        # capital_per_trade_frac is applied exactly once now, in optimize().
+        alpha = direction * magnitude * beta
 
-        exit_long = self.long_exit_threshold
-        exit_short = self.short_exit_threshold
+        return alpha
 
-        if state > 0:
-            if s_score >= -exit_long:
-                return 0.0
-            return target
-
-        if s_score <= exit_short:
-            return 0.0
-        return -target
-
-    def _regime_filter(self, market_vol, trend_strength):
-        if market_vol > self.volatility_threshold:
-            return False
-        if abs(trend_strength) > self.trend_threshold:
-            return False
-        return True
-
-    def optimise_weights(self, w_prev, cov_matrix, beta, z_score, rsi, adv, vols,
-                         borrow_rates, halted_indices=None, kappa=0.0,
-                         holding_days=0, pnl_since_entry=0.0,
-                         market_vol=0.0, trend_strength=0.0, rank=1, capital=None):
-        if halted_indices is None: halted_indices = []
+    def optimize(self, alpha, cov, w_prev, adv=None, vols=None):
+        N = self.N
+        alpha = np.asarray(alpha, dtype=float)
         w_prev = np.asarray(w_prev, dtype=float)
-        beta = np.asarray(beta, dtype=float)
-        adv = np.asarray(adv, dtype=float)
-        vols = np.asarray(vols, dtype=float)
-        borrow_rates = np.asarray(borrow_rates, dtype=float)
 
-        if kappa <= 0.0 or beta.shape[0] != self.N:
+        if np.abs(alpha).max() < 1e-10:
+            return np.zeros(N)
+
+        cov_reg = np.array(cov, dtype=float)
+        cov_reg = (cov_reg + cov_reg.T) / 2.0
+        eigvals = np.linalg.eigvalsh(cov_reg)
+        if eigvals.min() < 1e-8:
+            cov_reg += (1e-7 - min(eigvals.min(), 0)) * np.eye(N)
+
+        eff_leverage = self.max_leverage * self.capital_per_trade_frac
+        eff_max_wt = self.max_weight_per_asset * self.capital_per_trade_frac
+
+        try:
+            w_var = cp.Variable(N)
+            ret = alpha @ w_var
+            risk = cp.quad_form(w_var, cov_reg)
+            turnover = cp.norm1(w_var - w_prev)
+
+            objective = cp.Maximize(ret - self.gamma * risk - self.turnover_penalty * turnover)
+
+            constraints = [
+                cp.norm1(w_var) <= eff_leverage,
+                w_var >= -eff_max_wt,
+                w_var <= eff_max_wt,
+            ]
+
+            prob = cp.Problem(objective, constraints)
+
+            for solver in [cp.CLARABEL, cp.SCS]:
+                try:
+                    prob.solve(solver=solver, max_iters=500, warm_start=True, verbose=False)
+                    if prob.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE] and w_var.value is not None:
+                        result = np.array(w_var.value).flatten()
+                        result[np.abs(result) < 1e-4] = 0.0
+                        return result
+                except Exception:
+                    continue
+
+        except Exception:
+            pass
+
+        return self._fallback_allocation(alpha, w_prev)
+
+    def _fallback_allocation(self, alpha, w_prev):
+        alpha_norm = np.abs(alpha).sum()
+        if alpha_norm < 1e-10:
             return np.zeros(self.N)
 
-        if not self._regime_filter(market_vol, trend_strength):
-            return np.zeros(self.N)
+        eff_leverage = self.max_leverage * self.capital_per_trade_frac
+        eff_max_wt = self.max_weight_per_asset * self.capital_per_trade_frac
 
-        rank_scale = self.rank_position_scale.get(rank, 0.5)
+        target = alpha / alpha_norm * eff_leverage * self.target_fraction
+        target = np.clip(target, -eff_max_wt, eff_max_wt)
 
-        target_exposure = self._compute_target_exposure(z_score, w_prev, beta, rsi,
-                                                        holding_days, pnl_since_entry)
-        if abs(target_exposure) < 1e-12:
-            return np.zeros(self.N)
+        gross = np.abs(target).sum()
+        if gross > eff_leverage:
+            target *= eff_leverage / gross
 
-        norm_sq = np.sum(beta ** 2)
-        if norm_sq < 1e-12: return np.zeros(self.N)
-        w_ideal = (target_exposure / norm_sq) * beta
-        w_ideal = w_ideal * rank_scale
+        max_step = 0.15
+        delta = target - w_prev
+        delta = np.clip(delta, -max_step, max_step)
+        w_new = w_prev + delta
 
-        w = cp.Variable(self.N)
-        delta_w = w - w_prev
+        gross = np.abs(w_new).sum()
+        if gross > eff_leverage:
+            w_new *= eff_leverage / gross
 
-        tracking_error = cp.sum_squares(w - w_ideal)
-        total_friction = self.fee_rate + self.turnover_penalty
-        fee_penalty = total_friction * cp.norm(delta_w, 1)
-        borrow_penalty = borrow_rates @ cp.pos(-w)
+        w_new[np.abs(w_new) < 1e-4] = 0.0
+        return w_new
 
-        adv_safe = np.maximum(adv, 1.0)
-        eta = self.gamma * vols * np.sqrt((capital if capital is not None else self.aum) / adv_safe)
-        impact_penalty = cp.sum(cp.multiply(eta, cp.power(cp.abs(delta_w), 1.5)))
+    def check_forced_exit(self, w, holding_bars, halflife=50.0, coint_invalid=False,
+                           pnl_since_entry=None):
+        if coint_invalid:
+            return True
 
-        objective = cp.Minimize(20.0 * tracking_error + fee_penalty + borrow_penalty + impact_penalty)
+        # Data-driven stale-loss stop: trades still held past stale_loss_holding_bars
+        # AND underwater beyond stale_loss_threshold rarely recover (empirically,
+        # only ~6% of such trades ended up profitable, averaging ~-1.6% by the
+        # time they were eventually closed by the halflife cap). Cutting them
+        # here instead of waiting out the full halflife cap removes the worst
+        # tail of losing trades without touching the trades that are fine.
+        if (pnl_since_entry is not None
+                and holding_bars >= self.stale_loss_holding_bars
+                and pnl_since_entry < self.stale_loss_threshold):
+            return True
 
-        constraints = [
-            cp.sum(w) == 0,
-            cp.norm(w, 1) <= self.max_leverage * rank_scale,
-            cp.abs(w) <= self.max_weight_per_asset,
-        ]
-        for idx in halted_indices:
-            constraints.append(w[idx] == 0)
-
-        problem = cp.Problem(objective, constraints)
-
-        for solver in [cp.CLARABEL, cp.SCS]:
-            try:
-                problem.solve(solver=solver)
-                if problem.status in ["optimal", "optimal_inaccurate"] and w.value is not None:
-                    return np.asarray(w.value, dtype=float)
-            except Exception:
-                continue
-
-        self.logger.warning(f"Solver failed. Status: {problem.status}. Using fallback.")
-        return self._fallback_weights(w_ideal)
-
-    def _fallback_weights(self, w_ideal):
-        w = np.clip(w_ideal, -self.max_weight_per_asset, self.max_weight_per_asset)
-        w = w - np.mean(w)
-        if np.sum(np.abs(w)) > self.max_leverage:
-            w = w / (np.sum(np.abs(w)) / self.max_leverage)
-        return w
-
-    def _graceful_unwind(self, w_prev):
-        return w_prev * 0.9
+        max_bars = int(3.0 * halflife)
+        absolute_cap = 40 * 27
+        max_bars = min(max_bars, absolute_cap)
+        max_bars = max(max_bars, 27)
+        if holding_bars > max_bars:
+            return True
+        return False
