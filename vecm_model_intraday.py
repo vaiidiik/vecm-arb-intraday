@@ -1,15 +1,19 @@
 import numpy as np
 import pandas as pd
+from itertools import combinations
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
 
 class vecm:
-    def __init__(self, significance=0.05, entry_threshold=1.5, exit_threshold=0.0,
-                 short_exit_threshold=0.0, long_exit_threshold=0.0,
-                 min_kappa=2.0, max_kappa=50.0,
+    def __init__(self, significance=0.05, entry_threshold=1.5, exit_threshold=0.3,
+                 short_exit_threshold=0.3, long_exit_threshold=0.3,
+                 min_kappa=1.0, max_kappa=100.0,
                  volume_window=20, volume_clip=(0.5, 2.0),
-                 trend_lookback=120, trend_threshold=0.50,
-                 delay_span=5, k_ar_diff=5, periods_per_year=252):
+                 trend_lookback=135, trend_threshold=0.30,
+                 delay_span=3, k_ar_diff=3, periods_per_year=6804,
+                 rsi_period=14, rsi_overbought=65, rsi_oversold=35,
+                 macd_fast=12, macd_slow=26, macd_signal=9,
+                 use_pairwise=True, zscore_lookback=540):
         self.sig_level = significance
         self.critical_idx = 2 if significance <= 0.01 else 1 if significance <= 0.05 else 0
         self.entry_threshold = entry_threshold
@@ -25,168 +29,197 @@ class vecm:
         self.delay_span = delay_span
         self.k_ar_diff = k_ar_diff
         self.periods_per_year = periods_per_year
+        self.rsi_period = rsi_period
+        self.rsi_overbought = rsi_overbought
+        self.rsi_oversold = rsi_oversold
+        self.macd_fast = macd_fast
+        self.macd_slow = macd_slow
+        self.macd_signal = macd_signal
+        self.use_pairwise = use_pairwise
+        self.zscore_lookback = zscore_lookback
 
-    def is_trending(self, log_prices):
-        log_prices = np.asarray(log_prices, dtype=float)
-        if log_prices.shape[0] < 2:
-            return False
-        avg_return = float(np.mean(log_prices[-1] - log_prices[0]))
-        return abs(avg_return) > self.trend_threshold
-
-    def compute_rsi(self, series, period=14):
+    def compute_rsi(self, series, period=None):
+        if period is None:
+            period = self.rsi_period
+        series = np.asarray(series, dtype=float)
+        if len(series) < 2:
+            return np.array([50.0])
         delta = np.diff(series)
         gain = np.where(delta > 0, delta, 0.0)
         loss = np.where(delta < 0, -delta, 0.0)
-        if len(gain) == 0:
-            return np.array([50.0])
         avg_gain = pd.Series(gain).ewm(alpha=1.0 / period, adjust=False).mean().values
         avg_loss = pd.Series(loss).ewm(alpha=1.0 / period, adjust=False).mean().values
-        rs = np.divide(avg_gain, avg_loss, out=np.zeros_like(avg_gain), where=avg_loss != 0)
+        rs = np.divide(avg_gain, avg_loss, out=np.ones_like(avg_gain), where=avg_loss > 1e-10)
         rsi = 100.0 - (100.0 / (1.0 + rs))
         return np.concatenate(([50.0], rsi))
 
-    def cointegrate(self, log_prices):
+    def compute_macd(self, series):
+        series = np.asarray(series, dtype=float)
+        if len(series) < self.macd_slow + self.macd_signal:
+            return 0.0, 0.0, 0.0
+        s = pd.Series(series)
+        ema_fast = s.ewm(span=self.macd_fast, adjust=False).mean()
+        ema_slow = s.ewm(span=self.macd_slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=self.macd_signal, adjust=False).mean()
+        histogram = macd_line - signal_line
+        return float(macd_line.iloc[-1]), float(signal_line.iloc[-1]), float(histogram.iloc[-1])
+
+    def cointegrate(self, log_prices, critical_idx_override=None):
         log_prices = np.asarray(log_prices, dtype=float)
-        if log_prices.ndim != 2 or log_prices.shape[0] < 10 or log_prices.shape[1] < 2:
-            return 0, None
+        if log_prices.ndim != 2 or log_prices.shape[0] < 50 or log_prices.shape[1] < 2:
+            return 0, None, None, None
         if not np.isfinite(log_prices).all():
-            return 0, None
+            mask = np.isfinite(log_prices).all(axis=1)
+            log_prices = log_prices[mask]
+            if log_prices.shape[0] < 50:
+                return 0, None, None, None
+        critical_idx = self.critical_idx if critical_idx_override is None else critical_idx_override
         try:
             result = coint_johansen(log_prices, det_order=0, k_ar_diff=self.k_ar_diff)
+            trace_stats = result.lr1
+            critical_values = result.cvt[:, critical_idx]
+            rank = 0
+            for i in range(len(trace_stats)):
+                if np.isfinite(trace_stats[i]) and trace_stats[i] > critical_values[i]:
+                    rank += 1
+                else:
+                    break
+            rank = min(rank, log_prices.shape[1])
+            if rank == 0:
+                return 0, None, trace_stats, critical_values
+            beta = result.evec[:, :rank]
+            beta = self._normalize_beta(beta)
+            if beta is None:
+                return 0, None, trace_stats, critical_values
+            return rank, beta, trace_stats, critical_values
         except Exception:
-            return 0, None
-        trace_stats = result.lr1
-        critical_values = result.cvt[:, self.critical_idx]
-        rank = 0
-        for i in range(len(trace_stats)):
-            if np.isfinite(trace_stats[i]) and trace_stats[i] > critical_values[i]:
-                rank += 1
-            else:
-                break
-        rank = min(rank, log_prices.shape[1])
-        if rank == 0:
-            return 0, None
-        beta_set = self._normalize_beta_matrix(result.evec[:, :rank])
-        if beta_set is None:
-            return 0, None
-        return rank, beta_set
+            return 0, None, None, None
 
-    def _normalize_beta_matrix(self, beta_set):
+    def _normalize_beta(self, beta_set):
         beta_set = np.asarray(beta_set, dtype=float)
         if beta_set.ndim == 1:
             beta_set = beta_set.reshape(-1, 1)
         cols = []
         for idx in range(beta_set.shape[1]):
-            beta = beta_set[:, idx]
-            if not np.isfinite(beta).all():
+            b = beta_set[:, idx].copy()
+            if not np.isfinite(b).all():
                 continue
-            scale = np.sum(np.abs(beta))
+            scale = np.sum(np.abs(b))
             if scale < 1e-12:
                 continue
-            beta = beta / scale
-            anchor = np.argmax(np.abs(beta))
-            if beta[anchor] < 0:
-                beta = -beta
-            cols.append(beta)
+            b = b / scale
+            anchor = np.argmax(np.abs(b))
+            if b[anchor] < 0:
+                b = -b
+            cols.append(b)
         if not cols:
             return None
         return np.column_stack(cols)
 
-    def _fit_ou(self, spread_series):
-        spread_series = np.asarray(spread_series, dtype=float)
-        if len(spread_series) < 10 or not np.isfinite(spread_series).all():
-            return None
-        x = spread_series[:-1]
-        y = spread_series[1:]
-        n = len(x)
-        sx = np.sum(x); sy = np.sum(y)
-        sxx = np.sum(x * x); sxy = np.sum(x * y)
-        denom = n * sxx - sx * sx
-        if abs(denom) < 1e-12:
-            return None
-        b = (n * sxy - sx * sy) / denom
-        a = (sy - b * sx) / n
-        if not np.isfinite(a) or not np.isfinite(b) or b <= 0.0 or b >= 1.0:
-            return None
-        residuals = y - a - b * x
-        if len(residuals) < 3:
-            return None
-        var_zeta = np.var(residuals, ddof=2)
-        if not np.isfinite(var_zeta) or var_zeta <= 1e-16:
-            return None
-        kappa = -np.log(b) * self.periods_per_year
-        if not np.isfinite(kappa) or kappa < self.min_kappa or kappa > self.max_kappa:
-            return None
-        m = a / (1.0 - b)
-        sigma_eq = np.sqrt(var_zeta / (1.0 - b * b))
-        if not np.isfinite(m) or not np.isfinite(sigma_eq) or sigma_eq < 1e-10:
-            return None
-        return {"a": a, "b": b, "kappa": kappa, "m": m,
-                "sigma_eq": sigma_eq, "var_zeta": var_zeta}
+    def estimate_halflife(self, spread):
+        spread = np.asarray(spread, dtype=float)
+        if len(spread) < 20:
+            return 999.0
+        spread_dm = spread - np.mean(spread)
+        y = spread_dm[1:]
+        x = spread_dm[:-1]
+        denom = np.dot(x, x)
+        if denom < 1e-10:
+            return 999.0
+        phi = np.dot(x, y) / denom
+        if phi >= 1.0 or phi <= 0.0:
+            return 999.0
+        halflife = -np.log(2) / np.log(phi)
+        return max(halflife, 1.0)
 
-    def _score_candidates(self, current_log_prices, beta_set, historical_log_prices):
-        beta_set = self._normalize_beta_matrix(beta_set)
-        if beta_set is None:
-            return []
-        historical_log_prices = np.asarray(historical_log_prices, dtype=float)
-        current_log_prices = np.asarray(current_log_prices, dtype=float)
-        scores = []
-        for idx in range(beta_set.shape[1]):
-            beta = beta_set[:, idx]
-            historical_spread = historical_log_prices @ beta
-            spread_rsi = self.compute_rsi(historical_spread, period=14)
-            ou_params = self._fit_ou(historical_spread)
-            if ou_params is None:
-                continue
-            current_spread = float(current_log_prices @ beta)
-            current_rsi = spread_rsi[-1]
-            s_score = (current_spread - ou_params["m"]) / ou_params["sigma_eq"]
-            if np.isfinite(s_score) and abs(s_score) < 10.0:
-                scores.append({
-                    "s_score": float(s_score),
-                    "kappa": float(ou_params["kappa"]),
-                    "beta": beta,
-                    "rsi": current_rsi,
-                    "selection_score": abs(float(s_score)),
+    def compute_spread_z(self, spread, lookback=None):
+        if lookback is None:
+            lookback = self.zscore_lookback
+        spread = np.asarray(spread, dtype=float)
+        if len(spread) < 20:
+            return 0.0, 0.0, 1.0
+        window = spread[-lookback:] if len(spread) > lookback else spread
+        mu = np.mean(window)
+        sigma = np.std(window)
+        if sigma < 1e-10:
+            return 0.0, mu, 1.0
+        z = (spread[-1] - mu) / sigma
+        return float(z), float(mu), float(sigma)
+
+    def generate_all_signals(self, log_prices, n_assets):
+        candidates = []
+
+        rank_full, beta_full, trace_full, crit_full = self.cointegrate(log_prices)
+        if rank_full > 0 and beta_full is not None:
+            for v in range(min(rank_full, 3)):
+                bv = beta_full[:, v]
+                spread = log_prices @ bv
+                hl = self.estimate_halflife(spread)
+                if hl > 500:
+                    continue
+                z, mu, sigma = self.compute_spread_z(spread)
+                rsi_arr = self.compute_rsi(spread)
+                rsi = float(rsi_arr[-1])
+                _, _, macd_hist = self.compute_macd(spread)
+                score = abs(z) * (1.0 / max(hl, 1.0))
+                candidates.append({
+                    "type": "multivariate",
+                    "rank": rank_full,
+                    "beta_full": bv.copy(),
+                    "z": z,
+                    "halflife": hl,
+                    "mu": mu,
+                    "sigma": sigma,
+                    "rsi": rsi,
+                    "macd_hist": macd_hist,
+                    "score": score,
+                    "pair": None,
+                    "trace_stat": float(trace_full[v]) if trace_full is not None else 0.0,
+                    "critical_value": float(crit_full[v]) if crit_full is not None else 0.0,
                 })
-        return scores
 
-    def calculate_sscore(self, current_log_prices, beta, historical_log_prices):
-        scores = self._score_candidates(current_log_prices, beta, historical_log_prices)
-        if not scores:
-            return 0.0, 0.0, None, 50.0
-        selected = max(scores, key=lambda item: item["selection_score"])
-        return selected["s_score"], selected["kappa"], selected["beta"], selected["rsi"]
+        if self.use_pairwise:
+            for i, j in combinations(range(n_assets), 2):
+                pair_lp = log_prices[:, [i, j]]
+                pr, pb, ptr, pcr = self.cointegrate(pair_lp)
+                if pr > 0 and pb is not None:
+                    bv_pair = pb[:, 0]
+                    spread = pair_lp @ bv_pair
+                    hl = self.estimate_halflife(spread)
+                    if hl > 200:
+                        continue
+                    z, mu, sigma = self.compute_spread_z(spread)
+                    if abs(z) < 0.5:
+                        continue
+                    rsi_arr = self.compute_rsi(spread)
+                    rsi = float(rsi_arr[-1])
+                    _, _, macd_hist = self.compute_macd(spread)
+                    beta_full_vec = np.zeros(n_assets)
+                    beta_full_vec[i] = bv_pair[0]
+                    beta_full_vec[j] = bv_pair[1]
+                    score = abs(z) * (1.0 / max(hl, 1.0))
+                    candidates.append({
+                        "type": "pairwise",
+                        "rank": pr,
+                        "beta_full": beta_full_vec,
+                        "z": z,
+                        "halflife": hl,
+                        "mu": mu,
+                        "sigma": sigma,
+                        "rsi": rsi,
+                        "macd_hist": macd_hist,
+                        "score": score,
+                        "pair": (i, j),
+                        "trace_stat": float(ptr[0]) if ptr is not None else 0.0,
+                        "critical_value": float(pcr[0]) if pcr is not None else 0.0,
+                    })
 
-    def volume_adjust_returns(self, log_prices_window, adv_window):
-        log_prices_window = np.asarray(log_prices_window, dtype=float)
-        raw_returns = np.diff(log_prices_window, axis=0)
-        if adv_window is None:
-            return raw_returns
-        adv_window = np.asarray(adv_window, dtype=float)
-        if adv_window.shape[0] != log_prices_window.shape[0]:
-            return raw_returns
-        adjusted_returns = raw_returns.copy()
-        for idx in range(raw_returns.shape[0]):
-            end = idx + 2
-            start = max(0, end - self.volume_window)
-            typical_adv = np.mean(adv_window[start:end], axis=0)
-            current_adv = adv_window[idx + 1]
-            volume_factor = np.divide(
-                typical_adv, current_adv + 1e-8,
-                out=np.ones_like(typical_adv),
-                where=(current_adv + 1e-8) > 0
-            )
-            volume_factor = np.clip(volume_factor, self.volume_clip[0], self.volume_clip[1])
-            adjusted_returns[idx] = raw_returns[idx] * volume_factor
-        return adjusted_returns
+        if not candidates:
+            return []
 
-    def volume_adjust_log_prices(self, log_prices_window, adv_window):
-        adjusted_returns = self.volume_adjust_returns(log_prices_window, adv_window)
-        adjusted_log_prices = np.empty_like(log_prices_window, dtype=float)
-        adjusted_log_prices[0] = log_prices_window[0]
-        adjusted_log_prices[1:] = adjusted_log_prices[0] + np.cumsum(adjusted_returns, axis=0)
-        return adjusted_log_prices
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates[:3]
 
     def check_cointegration_stability(self, log_prices, beta, window=10):
         if beta is None:
@@ -202,10 +235,10 @@ class vecm:
         if len(spread) < window + 1:
             return True
         past = spread[-(window + 1):-1]
-        mean = np.mean(past)
-        std = np.std(past)
-        if std < 1e-8:
+        mean_val = np.mean(past)
+        std_val = np.std(past)
+        if std_val < 1e-8:
             return True
-        if abs(spread[-1] - mean) > 5.0 * std:
+        if abs(spread[-1] - mean_val) > 5.0 * std_val:
             return False
         return True
