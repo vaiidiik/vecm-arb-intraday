@@ -11,7 +11,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VECM_ARB.Runner")
 
-ASSETS = ["NVDA", "AMD", "TSM", "ASML", "AVGO", "QCOM"]
+ASSETS = ["JPM", "BAC", "C", "WFC", "GS", "MS"]
 INITIAL_CAPITAL = 1_000_000
 IMPACT_GAMMA = 0.05
 

@@ -11,7 +11,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VECM_ARB.Publisher")
 
-ASSETS = ["NVDA", "AMD", "TSM", "ASML", "AVGO", "QCOM"]
+ASSETS = ["JPM", "BAC", "C", "WFC", "GS", "MS"]
 BARS_PER_DAY = 27
 VOL_WINDOW = 20 * BARS_PER_DAY
 

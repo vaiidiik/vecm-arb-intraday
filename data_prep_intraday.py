@@ -13,9 +13,22 @@ prices = df.pivot(index="timestamp", columns="symbol", values="close").sort_inde
 df["dollar_volume"] = df["close"] * df["volume"]
 dollar_vol = df.pivot(index="timestamp", columns="symbol", values="dollar_volume").sort_index()
 
-prices = prices.ffill().bfill()
+prices = prices.ffill()
+# Fix: .bfill() here would fill any leading NaN (an asset with no price yet
+# at the very start of the window) using a *later* price -- textbook
+# lookahead, even though it's very unlikely to matter for continuously-
+# traded mega-caps. Drop those leading rows instead of inventing values
+# from the future; the strategy doesn't start trading until LOOKBACK bars
+# in anyway, so this costs nothing in practice.
+prices = prices.dropna(how="any")
+
 dollar_vol = dollar_vol.reindex(prices.index).ffill().fillna(0)
-dollar_adv = dollar_vol.rolling(window=ADV_WINDOW, min_periods=1).mean().shift(1).bfill()
+# Fix: shift(1) necessarily leaves exactly one leading NaN (there's no
+# "bar -1" to shift from). The previous .bfill() filled it from the *next*
+# row's ADV -- again lookahead, again on a bar that's always before
+# LOOKBACK and never read by any trading decision. Filling with 0 instead
+# keeps the guarantee that nothing here is derived from a future bar.
+dollar_adv = dollar_vol.rolling(window=ADV_WINDOW, min_periods=1).mean().shift(1).fillna(0.0)
 
 out_prices = os.path.join(script_dir, "sample_prices_intraday.csv")
 out_adv = os.path.join(script_dir, "sample_dollar_adv_intraday.csv")

@@ -13,7 +13,9 @@ class vecm:
                  delay_span=3, k_ar_diff=3, periods_per_year=6804,
                  rsi_period=14, rsi_overbought=65, rsi_oversold=35,
                  macd_fast=12, macd_slow=26, macd_signal=9,
-                 use_pairwise=True, zscore_lookback=540):
+                 use_pairwise=True, zscore_lookback=540,
+                 coint_stability_window=15,
+                 beta_support_tol=0.05):
         self.sig_level = significance
         self.critical_idx = 2 if significance <= 0.01 else 1 if significance <= 0.05 else 0
         self.entry_threshold = entry_threshold
@@ -37,6 +39,21 @@ class vecm:
         self.macd_signal = macd_signal
         self.use_pairwise = use_pairwise
         self.zscore_lookback = zscore_lookback
+
+        # Recommendation #1: default window (in bars) used by
+        # check_cointegration_stability's "has the spread blown out
+        # relative to its recent past" breakdown check.
+        self.coint_stability_window = coint_stability_window
+
+        # Recommendation #2: entries should be gated on relationship
+        # stability, not on moving the z cutoff. `beta_support_tol` sets
+        # how large a beta coefficient must be to count as "this asset
+        # participates in the relationship" when building a stable
+        # identity key for a candidate (see _signal_key). We track how
+        # many consecutive refits confirm the same relationship here,
+        # since generate_all_signals is called once per refit.
+        self.beta_support_tol = beta_support_tol
+        self._confirmation_history = {}
 
     def compute_rsi(self, series, period=None):
         if period is None:
@@ -147,6 +164,25 @@ class vecm:
         z = (spread[-1] - mu) / sigma
         return float(z), float(mu), float(sigma)
 
+    def _signal_key(self, sig):
+        """
+        Stable identity for a candidate relationship, used to count how
+        many consecutive refits have confirmed it (recommendation #2:
+        gate entries on stability rather than on the raw z cutoff).
+
+        Pairwise signals are keyed on the (sorted) asset pair, which is
+        exact and refit-invariant. Multivariate signals are keyed on the
+        rank and the *support* of the beta vector (which assets carry a
+        non-negligible weight) rather than the exact coefficients, since
+        those coefficients can drift slightly between refits even when
+        it's "the same" cointegrating relationship.
+        """
+        if sig.get("pair") is not None:
+            return ("pair",) + tuple(sorted(sig["pair"]))
+        bv = np.asarray(sig["beta_full"])
+        support = tuple(np.where(np.abs(bv) > self.beta_support_tol)[0])
+        return ("multi", sig.get("rank", 1)) + support
+
     def generate_all_signals(self, log_prices, n_assets):
         candidates = []
 
@@ -216,12 +252,32 @@ class vecm:
                     })
 
         if not candidates:
+            # No candidates this refit -- nothing is "confirmed" going
+            # into the next one.
+            self._confirmation_history = {}
             return []
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
-        return candidates[:3]
+        top = candidates[:3]
 
-    def check_cointegration_stability(self, log_prices, beta, window=10):
+        # Recommendation #2: stamp each surviving candidate with how many
+        # consecutive refits (including this one) have produced the same
+        # relationship. A relationship that drops out of the top-3 and
+        # later reappears starts its count over -- that's intentional,
+        # since the point is *consecutive* confirmation.
+        new_history = {}
+        for sig in top:
+            key = self._signal_key(sig)
+            count = self._confirmation_history.get(key, 0) + 1
+            sig["confirmations"] = count
+            new_history[key] = count
+        self._confirmation_history = new_history
+
+        return top
+
+    def check_cointegration_stability(self, log_prices, beta, window=None):
+        if window is None:
+            window = self.coint_stability_window
         if beta is None:
             return True
         beta = np.asarray(beta)

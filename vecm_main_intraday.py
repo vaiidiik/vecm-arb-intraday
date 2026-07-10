@@ -17,7 +17,6 @@ PREFERRED_ASSETS = ["JPM", "BAC", "C", "WFC", "GS", "MS"]
 INITIAL_CAPITAL = 1_000_000
 ENTRY_THRESHOLD = 1.7
 EXIT_THRESHOLD = 0.3
-ZERO_RANK_GRACE = 10
 
 BARS_PER_DAY = 27
 TRADING_DAYS_PER_YEAR = 252
@@ -29,10 +28,15 @@ VOL_WINDOW = 10 * BARS_PER_DAY
 SPREAD_WINDOW = 20 * BARS_PER_DAY
 REFIT_INTERVAL = BARS_PER_DAY
 
-EXIT_CRITICAL_IDX = 0
-COINT_INVALID_STREAK_REQUIRED = 1
-STABILITY_WINDOW = 10 * BARS_PER_DAY
+NUM_SLOTS = 2
+SLOT_CAPITAL_FRAC = 0.5
 
+ENABLE_RANK_DROP_EXIT = True
+ENABLE_COINT_STABILITY_EXIT = True
+RANK_DROP_CONFIRMATIONS = 5
+COINT_STABILITY_CONFIRMATIONS = 2
+
+GAP_HOURS_THRESHOLD = 6.0
 
 def _borrow_rates(assets, adv, vols):
     base_annual = {
@@ -47,6 +51,77 @@ def _borrow_rates(assets, adv, vols):
     annual = annual * (1.0 + 0.25 * vol_stress + 0.15 * liquidity_stress)
     return annual / PERIODS_PER_YEAR
 
+def _slot_z(beta, log_recent, math_engine, window):
+    if beta is None:
+        return 0.0
+    spread = log_recent @ beta
+    if len(spread) < 20:
+        return 0.0
+    z, _, _ = math_engine.compute_spread_z(spread, lookback=window)
+    return z
+
+def _new_slot(N):
+    return {
+        "w": np.zeros(N),
+        "holding_start": None,
+        "entry_prices": None,
+        "entry_w": None,
+        "entry_z": None,
+        "active_halflife": 50.0,
+        "active_pair": None,
+        "active_beta": None,
+        "_was_flat": True,
+        "_coint_broken": False,
+        "_rank_zero_streak": 0,
+        "_coint_break_streak": 0,
+    }
+
+def _slot_pnl(slot, p_now):
+    if slot["entry_prices"] is None:
+        return 0.0
+    safe_entry = np.where(slot["entry_prices"] > 0, slot["entry_prices"], 1.0)
+    price_ret = (p_now - slot["entry_prices"]) / safe_entry
+    return float(np.dot(slot["entry_w"], price_ret))
+
+def _slot_bar_return(slot, p_prev, p_now):
+    if slot["w"] is None:
+        return 0.0
+    safe_prev = np.where(p_prev > 0, p_prev, 1.0)
+    return float(np.dot(slot["w"], (p_now - p_prev) / safe_prev))
+
+def _gap_hours(ts_now, ts_prev):
+    if ts_prev is None:
+        return 0.0
+    try:
+        return (ts_now - ts_prev).total_seconds() / 3600.0
+    except (TypeError, AttributeError):
+        return 0.0
+
+def _reset_slot(slot, N):
+    slot["w"] = np.zeros(N)
+    slot["holding_start"] = None
+    slot["entry_prices"] = None
+    slot["entry_w"] = None
+    slot["entry_z"] = None
+    slot["active_halflife"] = 50.0
+    slot["active_pair"] = None
+    slot["active_beta"] = None
+    slot["_coint_broken"] = False
+    slot["_rank_zero_streak"] = 0
+    slot["_coint_break_streak"] = 0
+
+def _enter_slot(slot, sig, w_new, t, p_now):
+    slot["w"] = w_new
+    slot["holding_start"] = t
+    slot["entry_prices"] = p_now.copy()
+    slot["entry_w"] = w_new.copy()
+    slot["entry_z"] = sig["z"]
+    slot["active_halflife"] = sig.get("halflife", 50.0)
+    slot["active_pair"] = sig.get("pair")
+    slot["active_beta"] = sig.get("beta_full")
+    slot["_coint_broken"] = False
+    slot["_rank_zero_streak"] = 0
+    slot["_coint_break_streak"] = 0
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -100,31 +175,33 @@ def main():
         short_exit_threshold=EXIT_THRESHOLD,
         long_exit_threshold=EXIT_THRESHOLD,
         turnover_penalty=0.0005,
-        max_leverage=1.5,
-        max_weight_per_asset=0.45,
+        max_leverage=1.0,
+        max_weight_per_asset=0.8,
         target_fraction=0.8,
         volatility_threshold=0.50,
         periods_per_year=PERIODS_PER_YEAR,
-        capital_per_trade_frac=1.0,
+
+        max_entry_halflife=120,
+        min_beta_confirmations=2,
+
+        preempt_z_ratio=2.0,
+        preempt_quality_margin=1.4,
+        preempt_min_holding_bars=10,
+        gap_shock_threshold=-0.004,
+        enable_gap_shock=False,
     )
 
     backtester = PortfolioBacktester(
         initial_capital=INITIAL_CAPITAL,
-        gamma=0.0,
+
+        gamma=0.10,
         maker_taker_fee=0.0,
         periods_per_year=PERIODS_PER_YEAR,
-        impact_gamma=0.0,
     )
 
-    w = np.zeros(N)
+    slots = [_new_slot(N) for _ in range(NUM_SLOTS)]
+
     cached_signals = []
-    zero_rank_streak = 0
-    holding_start = None
-    entry_capital = None
-    active_halflife = 50.0
-    active_pair = None
-    active_beta = None
-    invalid_streak = 0
     exit_log = []
 
     print("Starting backtest...")
@@ -139,36 +216,30 @@ def main():
         vol_now = vols_all[t]
 
         bars_since_start = t - LOOKBACK
-
-        coint_invalid = False
-        coint_blowup = False
+        gap_hours = _gap_hours(date, dates[t - 1] if t > 0 else None)
+        is_gap_bar = gap_hours >= GAP_HOURS_THRESHOLD
 
         if bars_since_start % REFIT_INTERVAL == 0 or not cached_signals:
             log_window = log_prices_all[t - LOOKBACK:t]
             cached_signals = math_engine.generate_all_signals(log_window, N)
             refit_count += 1
 
-            if np.abs(w).sum() > 0.01:
-                if active_pair is not None:
-                    pair_lp = log_window[:, list(active_pair)]
-                    pair_beta = active_beta[list(active_pair)] if active_beta is not None else None
-                    pair_rank, _, _, _ = math_engine.cointegrate(pair_lp, critical_idx_override=EXIT_CRITICAL_IDX)
-                    rank_failed = (pair_rank == 0)
-                    stability_ok = math_engine.check_cointegration_stability(pair_lp, pair_beta, window=STABILITY_WINDOW)
+            for slot in slots:
+                if np.abs(slot["w"]).sum() <= 0.01:
+                    continue
+                if slot["active_pair"] is not None:
+                    i, j = slot["active_pair"]
+                    pair_rank_now, _, _, _ = math_engine.cointegrate(log_window[:, [i, j]])
+                    rank_now = pair_rank_now
                 else:
-                    full_rank, _, _, _ = math_engine.cointegrate(log_window, critical_idx_override=EXIT_CRITICAL_IDX)
-                    rank_failed = (full_rank == 0)
-                    stability_ok = math_engine.check_cointegration_stability(log_window, active_beta, window=STABILITY_WINDOW)
+                    rank_full_now, _, _, _ = math_engine.cointegrate(log_window)
+                    rank_now = rank_full_now
 
-                coint_blowup = not stability_ok
-                if coint_blowup:
-                    invalid_streak = COINT_INVALID_STREAK_REQUIRED
-                elif rank_failed:
-                    invalid_streak += 1
+                if rank_now == 0:
+                    slot["_rank_zero_streak"] = slot.get("_rank_zero_streak", 0) + 1
                 else:
-                    invalid_streak = 0
-
-                coint_invalid = invalid_streak >= COINT_INVALID_STREAK_REQUIRED
+                    slot["_rank_zero_streak"] = 0
+                slot["_coint_broken"] = slot["_rank_zero_streak"] >= RANK_DROP_CONFIRMATIONS
 
         spread_start = max(0, t - SPREAD_WINDOW)
         log_recent = log_prices_all[spread_start:t + 1]
@@ -194,6 +265,8 @@ def main():
                 "macd_hist": macd_hist,
                 "pair": sig.get("pair"),
                 "rank": sig.get("rank", 1),
+
+                "confirmations": sig.get("confirmations", 1),
                 "score": abs(z) / max(halflife_sig, 1.0),
             })
 
@@ -202,111 +275,159 @@ def main():
         if live_signals:
             z_primary = live_signals[0]["z"]
             rank_primary = live_signals[0]["rank"]
-            zero_rank_streak = 0
         else:
             z_primary = 0.0
             rank_primary = 0
-            zero_rank_streak += 1
 
-        gross_exp = np.abs(w).sum()
+        total_w_prev = sum((slot["w"] for slot in slots), np.zeros(N))
 
-        if gross_exp > 0.01:
-            if entry_capital is None:
-                entry_capital = backtester.capital
-            pnl_since_entry = (backtester.capital - entry_capital) / entry_capital if entry_capital > 0 else 0.0
-            holding_bars = t - holding_start if holding_start is not None else 0
-        else:
-            pnl_since_entry = 0.0
-            holding_bars = 0
+        for slot in slots:
+            slot["_was_flat"] = np.abs(slot["w"]).sum() < 0.01
 
-        force_exit = False
-        if gross_exp > 0.01:
-            force_exit = risk_engine.check_forced_exit(
-                w, holding_bars, halflife=active_halflife, coint_invalid=coint_invalid,
-                pnl_since_entry=pnl_since_entry
-            )
+        slot_quality = {}
 
-        w_new = w.copy()
-        exit_reason = None
-        entry_reason = None
+        for slot_idx, slot in enumerate(slots):
+            gross_s = np.abs(slot["w"]).sum()
+            if gross_s <= 0.01:
+                continue
 
-        if force_exit and gross_exp > 0.01:
-            w_new = np.zeros(N)
-            if coint_blowup:
-                exit_reason = "coint_blowup"
-            elif coint_invalid:
-                exit_reason = "coint_persistent_invalid"
-            elif (holding_bars >= risk_engine.stale_loss_holding_bars
-                  and pnl_since_entry < risk_engine.stale_loss_threshold):
-                exit_reason = "stale_loss_stop"
-            else:
-                exit_reason = "halflife_cap"
+            holding_bars = t - slot["holding_start"]
+            pnl_since_entry = _slot_pnl(slot, p_now)
+            bar_ret = _slot_bar_return(slot, p_prev, p_now)
+            z_slot = _slot_z(slot["active_beta"], log_recent, math_engine, SPREAD_WINDOW)
 
-        elif gross_exp > 0.01 and abs(z_primary) < EXIT_THRESHOLD:
-            w_new = np.zeros(N)
-            exit_reason = "z_decay"
-
-        elif zero_rank_streak > ZERO_RANK_GRACE and gross_exp > 0.01:
-            w_new = np.zeros(N)
-            exit_reason = "zero_rank_streak"
-
-        elif gross_exp < 0.01 and live_signals and abs(z_primary) >= ENTRY_THRESHOLD:
-            alpha = risk_engine.compute_alpha(live_signals, N, current_position=w)
-
-            if np.abs(alpha).max() > 1e-10:
-                cov_start = max(0, t - COV_WINDOW)
-                ret_window = returns_all[cov_start:t]
-                if ret_window.shape[0] < N + 5:
-                    cov = np.eye(N) * 0.001
+            if ENABLE_COINT_STABILITY_EXIT:
+                if not math_engine.check_cointegration_stability(log_recent, slot["active_beta"]):
+                    slot["_coint_break_streak"] = slot.get("_coint_break_streak", 0) + 1
                 else:
-                    cov = np.cov(ret_window, rowvar=False)
-                    shrinkage = 0.2
-                    cov = (1 - shrinkage) * cov + shrinkage * np.diag(np.diag(cov))
-                    cov = (cov + cov.T) / 2.0
-                    cov += 1e-7 * np.eye(N)
+                    slot["_coint_break_streak"] = 0
+            else:
+                slot["_coint_break_streak"] = 0
 
-                w_new = risk_engine.optimize(alpha, cov, w, adv_now, vol_now)
-                if np.abs(w_new).sum() > 0.01:
-                    entry_reason = "signal_entry"
+            exit_reason = None
+            if ENABLE_RANK_DROP_EXIT and slot.get("_coint_broken"):
+                exit_reason = "rank_dropped"
+            elif ENABLE_COINT_STABILITY_EXIT and slot.get("_coint_break_streak", 0) >= COINT_STABILITY_CONFIRMATIONS:
+                exit_reason = "cointegration_breakdown"
+            elif abs(z_slot) < EXIT_THRESHOLD:
+                exit_reason = "z_decay"
+            elif risk_engine.check_gap_shock(bar_ret, is_gap_bar):
+                exit_reason = "gap_shock"
 
-        entry_capital_before = entry_capital
+            if exit_reason is not None:
+                exit_log.append({
+                    "date": date, "slot": slot_idx, "event": "exit", "reason": exit_reason,
+                    "holding_bars": holding_bars, "pnl_since_entry": pnl_since_entry,
+                    "entry_z": slot.get("entry_z"), "exit_z": z_slot,
+                })
+                _reset_slot(slot, N)
+            else:
+                slot_quality[slot_idx] = {
+                    "score": abs(z_slot) / max(slot["active_halflife"], 1.0),
+                    "z": z_slot,
+                    "holding_bars": holding_bars,
+                }
 
-        new_gross = np.abs(w_new).sum()
-        if gross_exp < 0.01 and new_gross > 0.01:
-            holding_start = t
-            entry_capital = backtester.capital
-            active_halflife = live_signals[0].get("halflife", 50.0) if live_signals else 50.0
-            active_pair = live_signals[0].get("pair") if live_signals else None
-            active_beta = live_signals[0].get("beta_full") if live_signals else None
-            invalid_streak = 0
-        elif new_gross < 0.01:
-            holding_start = None
-            entry_capital = None
-            active_halflife = 50.0
-            active_pair = None
-            active_beta = None
-            invalid_streak = 0
+        used_signatures = set()
+        for slot in slots:
+            if np.abs(slot["w"]).sum() > 0.01 and slot["active_beta"] is not None:
+                used_signatures.add(tuple(np.round(slot["active_beta"], 6)))
+
+        cov_start = max(0, t - COV_WINDOW)
+        cov_now = risk_engine.covariance_from_prices(prices_all[cov_start:t + 1])
+
+        for slot_idx, slot in enumerate(slots):
+            if not slot["_was_flat"] or np.abs(slot["w"]).sum() > 0.01:
+                continue
+
+            chosen = None
+            for sig in live_signals:
+                sig_key = tuple(np.round(sig["beta_full"], 6))
+                if sig_key in used_signatures:
+                    continue
+                alpha_candidate = risk_engine.compute_alpha([sig], N)
+                if np.abs(alpha_candidate).max() < 1e-10:
+                    continue
+
+                other_gross = sum(
+                    np.abs(slots[j]["w"]).sum() for j in range(NUM_SLOTS) if j != slot_idx
+                )
+                available_frac = max(0.0, risk_engine.max_leverage - other_gross)
+                frac = risk_engine.conviction_capital_frac(sig["z"], SLOT_CAPITAL_FRAC, available_frac)
+                if frac <= 0.0:
+                    continue
+                w_candidate = risk_engine.optimize(
+                    alpha_candidate, cov_now, np.zeros(N),
+                    adv=adv_now, vols=vol_now, capital_frac=frac,
+                )
+                if np.abs(w_candidate).sum() > 0.01:
+                    chosen = (sig, w_candidate, frac)
+                    break
+
+            if chosen is not None:
+                sig, w_new, frac = chosen
+                _enter_slot(slot, sig, w_new, t, p_now)
+                used_signatures.add(tuple(np.round(sig["beta_full"], 6)))
+                exit_log.append({
+                    "date": date, "slot": slot_idx, "event": "entry", "reason": "signal_entry",
+                    "holding_bars": 0, "pnl_since_entry": 0.0,
+                    "entry_z": sig["z"], "exit_z": None, "capital_frac": round(frac, 4),
+                })
+
+        all_full = sum(np.abs(slot["w"]).sum() > 0.01 for slot in slots) == NUM_SLOTS
+        if all_full and slot_quality:
+            weakest_idx = min(slot_quality, key=lambda i: slot_quality[i]["score"])
+            weakest = slot_quality[weakest_idx]
+
+            for sig in live_signals:
+                sig_key = tuple(np.round(sig["beta_full"], 6))
+                if sig_key in used_signatures:
+                    continue
+                if not risk_engine.should_preempt(sig, weakest["score"], weakest["holding_bars"]):
+                    continue
+                alpha_candidate = risk_engine.compute_alpha([sig], N)
+                if np.abs(alpha_candidate).max() < 1e-10:
+                    continue
+                other_gross = sum(
+                    np.abs(slots[j]["w"]).sum() for j in range(NUM_SLOTS) if j != weakest_idx
+                )
+                available_frac = max(0.0, risk_engine.max_leverage - other_gross)
+                frac = risk_engine.conviction_capital_frac(sig["z"], SLOT_CAPITAL_FRAC, available_frac)
+                if frac <= 0.0:
+                    continue
+
+                w_candidate = risk_engine.optimize(
+                    alpha_candidate, cov_now, slots[weakest_idx]["w"],
+                    adv=adv_now, vols=vol_now, capital_frac=frac,
+                )
+                if np.abs(w_candidate).sum() <= 0.01:
+                    continue
+
+                slot = slots[weakest_idx]
+                evicted_pnl = _slot_pnl(slot, p_now)
+                exit_log.append({
+                    "date": date, "slot": weakest_idx, "event": "exit", "reason": "preempted",
+                    "holding_bars": weakest["holding_bars"], "pnl_since_entry": evicted_pnl,
+                    "entry_z": slot.get("entry_z"), "exit_z": weakest["z"],
+                })
+
+                _enter_slot(slot, sig, w_candidate, t, p_now)
+                used_signatures.add(sig_key)
+                exit_log.append({
+                    "date": date, "slot": weakest_idx, "event": "entry", "reason": "preempt_entry",
+                    "holding_bars": 0, "pnl_since_entry": 0.0,
+                    "entry_z": sig["z"], "exit_z": None, "capital_frac": round(frac, 4),
+                })
+                break
+
+        total_w_new = sum((slot["w"] for slot in slots), np.zeros(N))
 
         borrow = _borrow_rates(assets, adv_now, vol_now)
 
         backtester.process_day(
-            date, w, w_new, p_prev, p_now, adv_now, vol_now,
+            date, total_w_prev, total_w_new, p_prev, p_now, adv_now, vol_now,
             z_primary, rank_primary, borrow
         )
-
-        if exit_reason is not None and entry_capital_before:
-            realized_pnl = (backtester.capital - entry_capital_before) / entry_capital_before
-            exit_log.append({
-                "date": date, "event": "exit", "reason": exit_reason,
-                "holding_bars": holding_bars, "pnl_since_entry": realized_pnl,
-            })
-        if entry_reason is not None:
-            exit_log.append({
-                "date": date, "event": "entry", "reason": entry_reason,
-                "holding_bars": 0, "pnl_since_entry": 0.0,
-            })
-
-        w = w_new.copy()
 
         if bars_since_start > 0 and bars_since_start % (BARS_PER_DAY * 50) == 0:
             elapsed = time.time() - t0
@@ -341,6 +462,6 @@ def main():
     for k, v in metrics.items():
         print(f"  {k:20s}: {v}")
 
-
 if __name__ == "__main__":
     main()
+

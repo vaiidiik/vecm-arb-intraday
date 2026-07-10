@@ -5,11 +5,20 @@ import logging
 
 class PortfolioBacktester:
     def __init__(self, initial_capital=1000000.0, gamma=0.10, maker_taker_fee=0.0,
-                 periods_per_year=6804.0, impact_gamma=0.0):
+                 periods_per_year=6804.0,
+                 risk_free_rate=0.04, credit_idle_cash=True):
         self.periods_per_year = periods_per_year
         self.initial_capital = initial_capital
         self.capital = initial_capital
         self.gross_capital = initial_capital
+        # `gamma` is the square-root market-impact coefficient used in
+        # process_day below. It was accepted here from the start but never
+        # actually wired into a cost calculation -- Market_Impact was
+        # hardcoded to 0.0 regardless of trade size or liquidity. There was
+        # also a second, separate `impact_gamma` constructor parameter that
+        # was accepted and silently discarded (never even stored) -- pure
+        # dead weight from an earlier naming attempt. Removed; `gamma` is
+        # now the single, real impact coefficient.
         self.gamma = gamma
         self.fee_rate = maker_taker_fee
         self.daily_results = []
@@ -22,6 +31,24 @@ class PortfolioBacktester:
         self.position_pnl = {}
         self.trade_count = 0
         self.trade_log = []
+
+        # --- Idle-cash yield credit (data-driven addition) ---
+        # compute_metrics()'s Sharpe subtracts risk_free_rate from returns,
+        # which implicitly assumes the capital *not* deployed in the
+        # strategy could otherwise sit in risk-free cash. But process_day
+        # never credited anything on the undeployed fraction of capital --
+        # avg_exposure sits around 0.47, and there were verified multi-week
+        # stretches (900-1100+ consecutive bars) at zero exposure where
+        # Capital didn't move by a cent. That's an inconsistent comparison:
+        # the strategy is judged against a risk-free benchmark it was never
+        # actually given credit for approximating. Charging Borrow_Cost on
+        # the short side without crediting anything on the idle side is the
+        # same asymmetry. risk_free_rate here is deliberately the same
+        # constant compute_metrics() uses, so "strategy vs. cash" is an
+        # apples-to-apples comparison. Set credit_idle_cash=False to
+        # reproduce the old (uncredited) behavior for an A/B comparison.
+        self.risk_free_rate = risk_free_rate
+        self.credit_idle_cash = credit_idle_cash
 
     def position_pnl_sum(self):
         return sum(self.position_pnl.values())
@@ -72,14 +99,50 @@ class PortfolioBacktester:
         notional_traded = self.capital * np.sum(np.abs(delta_w))
         base_fees = float(notional_traded * self.fee_rate) if turnover > 1e-6 else 0.0
 
+        # --- Square-root market impact (data-driven addition) ---
+        # `adv` and `vols` were accepted as parameters here from the start
+        # but never used -- Market_Impact was hardcoded to 0.0 no matter
+        # how large a trade was relative to the asset's own liquidity. This
+        # is the standard square-root impact law: cost scales with the
+        # asset's own volatility and the square root of its participation
+        # rate (notional traded / ADV) for THAT bar's trade in THAT asset.
+        # An asset with missing/zero ADV is floored at $1 rather than
+        # treated as infinitely liquid, so a data gap reads as "assume
+        # illiquid" (conservative) instead of silently free to trade.
+        # `self.gamma` is the calibration constant; it is illustrative here
+        # (not fit to real market-impact data) and should be validated/
+        # recalibrated before being trusted for real capacity decisions.
+        notional_traded_per_asset = self.capital * np.abs(delta_w)
+        if turnover > 1e-6 and self.gamma > 0:
+            safe_adv = np.where(adv > 1e-6, adv, 1.0)
+            participation = notional_traded_per_asset / safe_adv
+            market_impact = float(np.sum(
+                self.gamma * vols * np.sqrt(np.clip(participation, 0.0, None)) * notional_traded_per_asset
+            ))
+        else:
+            market_impact = 0.0
+
         short_weights = np.minimum(w_prev, 0.0)
         borrow_cost = float(self.capital * np.dot(-short_weights, borrow_rates)) if np.any(short_weights < -1e-6) else 0.0
 
-        total_friction = base_fees + borrow_cost
-        net_pnl = gross_pnl - total_friction
+        total_friction = base_fees + borrow_cost + market_impact
+
+        # Idle-cash yield credit: the capital not deployed by w_prev
+        # (long + short legs both count as "deployed") earns risk_free_rate,
+        # same rate compute_metrics() nets out of the Sharpe ratio. Uses
+        # w_prev (not w_new) since that's the exposure actually carried
+        # *through* this bar -- consistent with how gross_pnl above is
+        # computed off w_prev.
+        if self.credit_idle_cash:
+            idle_frac = float(np.clip(1.0 - np.abs(w_prev).sum(), 0.0, 1.0))
+            cash_yield = self.capital * idle_frac * self.risk_free_rate / self.periods_per_year
+        else:
+            cash_yield = 0.0
+
+        net_pnl = gross_pnl - total_friction + cash_yield
 
         self.capital += net_pnl
-        self.gross_capital += gross_pnl
+        self.gross_capital += gross_pnl + cash_yield
         self.peak_capital = max(self.peak_capital, self.capital)
         drawdown = (self.peak_capital - self.capital) / self.peak_capital if self.peak_capital > 0 else 0.0
 
@@ -96,8 +159,9 @@ class PortfolioBacktester:
             "Net_PnL": round(net_pnl, 2),
             "Total_Friction": round(total_friction, 4),
             "Base_Fees": round(base_fees, 4),
-            "Market_Impact": 0.0,
+            "Market_Impact": round(market_impact, 4),
             "Borrow_Cost": round(borrow_cost, 4),
+            "Cash_Yield": round(cash_yield, 4),
             "Drawdown": round(drawdown, 6),
             "drawdown": round(drawdown, 6),
             "Z_Score": round(float(z_score), 4),
@@ -141,7 +205,7 @@ class PortfolioBacktester:
         if len(returns) > 1:
             vol = float(np.std(returns) * np.sqrt(self.periods_per_year))
             mean_ret = float(np.mean(returns) * self.periods_per_year)
-            sharpe = (mean_ret - 0.04) / vol if vol > 1e-10 else 0.0
+            sharpe = (mean_ret - self.risk_free_rate) / vol if vol > 1e-10 else 0.0
         else:
             vol = 0.0
             sharpe = 0.0
