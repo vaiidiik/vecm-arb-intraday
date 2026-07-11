@@ -1,2 +1,5 @@
 __pycache__/
 .DS_Store
+fetch_data_alpaca.py
+combined_banks_15min_2020_2025.csv
+combined_banks_15min_2020_2025_RTH_clean.csv
