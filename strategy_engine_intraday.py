@@ -12,9 +12,12 @@ BARS_PER_DAY = 27
 TRADING_DAYS_PER_YEAR = 252
 PERIODS_PER_YEAR = BARS_PER_DAY * TRADING_DAYS_PER_YEAR
 
-LOOKBACK = 200 * BARS_PER_DAY
-TREND_WINDOW = 21 * BARS_PER_DAY
+# Matched to vecm_main_intraday.py -- was 200*BARS_PER_DAY here, which meant
+# the "live" engine was fitting cointegration on a ~200-day window while the
+# offline backtest used 60 days. Same strategy needs the same window.
+LOOKBACK = 60 * BARS_PER_DAY
 COV_WINDOW = 10 * BARS_PER_DAY
+SPREAD_WINDOW = 20 * BARS_PER_DAY
 
 ENTRY_THRESHOLD = 1.7
 EXIT_THRESHOLD = 0.3
@@ -24,7 +27,10 @@ SLOT_CAPITAL_FRAC = 0.5
 
 ENABLE_RANK_DROP_EXIT = True
 ENABLE_COINT_STABILITY_EXIT = True
-RANK_DROP_CONFIRMATIONS = 2
+# Matched to vecm_main_intraday.py -- was 2 here vs 5 there, meaning the live
+# engine would force-liquidate on a rank drop 2.5x faster than the backtest
+# it's supposed to mirror.
+RANK_DROP_CONFIRMATIONS = 5
 COINT_STABILITY_CONFIRMATIONS = 2
 
 GAP_HOURS_THRESHOLD = 6.0
@@ -115,7 +121,7 @@ def _enter_slot(slot, sig, w_new, t, p_now):
     slot["_coint_break_streak"] = 0
 
 class VECMStrategyEngine:
-    def __init__(self, assets, initial_capital=1_000_000, impact_gamma=0.05):
+    def __init__(self, assets, initial_capital=1_000_000, impact_gamma=0.10):
         self.assets = list(assets)
         self.N = len(self.assets)
         self.logger = logging.getLogger("VECM_ARB.Engine")
@@ -124,26 +130,41 @@ class VECMStrategyEngine:
             max_workers=1, thread_name_prefix="vecm_worker"
         )
 
+        # Matched to vecm_main_intraday.py's math_engine exactly. significance
+        # (was 0.01, now 0.05) changes which Johansen critical-value column is
+        # used, and k_ar_diff (was 7, now 3) changes the VAR lag order fed
+        # into coint_johansen -- both actually change the test's output, not
+        # just cosmetic. min_kappa/max_kappa/delay_span are accepted by `vecm`
+        # but never referenced anywhere in vecm_model_intraday.py (dead
+        # parameters); kept here only so the two constructor calls read
+        # identically side by side.
         self.math_engine = vecm(
-            significance=0.01,
+            significance=0.05,
             entry_threshold=ENTRY_THRESHOLD,
-            min_kappa=2.0,
-            max_kappa=150.0,
-            delay_span=5,
-            k_ar_diff=7,
+            exit_threshold=EXIT_THRESHOLD,
+            min_kappa=1.0,
+            max_kappa=100.0,
+            k_ar_diff=3,
             periods_per_year=PERIODS_PER_YEAR,
+            rsi_period=14,
+            use_pairwise=True,
+            zscore_lookback=SPREAD_WINDOW,
         )
 
         self.risk_engine = dynamic_risk_engine(
             num_assets=self.N,
             aum=initial_capital,
+            gamma=0.05,
             entry_threshold=ENTRY_THRESHOLD,
             exit_threshold=EXIT_THRESHOLD,
             short_exit_threshold=EXIT_THRESHOLD,
             long_exit_threshold=EXIT_THRESHOLD,
+            turnover_penalty=0.0005,
             max_leverage=1.0,
             max_weight_per_asset=0.8,
             target_fraction=0.8,
+            volatility_threshold=0.50,
+            periods_per_year=PERIODS_PER_YEAR,
 
             max_entry_halflife=120,
             min_beta_confirmations=2,
@@ -154,8 +175,14 @@ class VECMStrategyEngine:
             gap_shock_threshold=-0.004,
             enable_gap_shock=False,
         )
+        # `impact_gamma` here now defaults to 0.10 to match vecm_main_intraday.py's
+        # backtester gamma. run_strategy_intraday.py currently passes an explicit
+        # IMPACT_GAMMA=0.05, which would still override this default -- update
+        # that constant too if you want the two to actually match at runtime.
         self.backtester = PortfolioBacktester(
-            initial_capital=initial_capital, gamma=impact_gamma,
+            initial_capital=initial_capital,
+            gamma=impact_gamma,
+            maker_taker_fee=0.0,
             periods_per_year=PERIODS_PER_YEAR,
         )
 
@@ -212,7 +239,6 @@ class VECMStrategyEngine:
                     s["_rank_zero_streak"] = 0
                 s["_coint_broken"] = s["_rank_zero_streak"] >= RANK_DROP_CONFIRMATIONS
 
-        SPREAD_WINDOW = 20 * BARS_PER_DAY
         spread_start = max(0, len(log_window) - SPREAD_WINDOW)
         log_recent = log_window[spread_start:]
 
@@ -438,4 +464,3 @@ class VECMStrategyEngine:
             pd.DataFrame(self._trade_log).to_csv(trade_log_path, index=False)
         _, metrics = self.backtester.generate_metrics()
         return metrics
-

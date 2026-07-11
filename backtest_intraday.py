@@ -11,14 +11,6 @@ class PortfolioBacktester:
         self.initial_capital = initial_capital
         self.capital = initial_capital
         self.gross_capital = initial_capital
-        # `gamma` is the square-root market-impact coefficient used in
-        # process_day below. It was accepted here from the start but never
-        # actually wired into a cost calculation -- Market_Impact was
-        # hardcoded to 0.0 regardless of trade size or liquidity. There was
-        # also a second, separate `impact_gamma` constructor parameter that
-        # was accepted and silently discarded (never even stored) -- pure
-        # dead weight from an earlier naming attempt. Removed; `gamma` is
-        # now the single, real impact coefficient.
         self.gamma = gamma
         self.fee_rate = maker_taker_fee
         self.daily_results = []

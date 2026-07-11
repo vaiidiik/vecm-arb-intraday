@@ -13,7 +13,7 @@ logger = logging.getLogger("VECM_ARB.Runner")
 
 ASSETS = ["JPM", "BAC", "C", "WFC", "GS", "MS"]
 INITIAL_CAPITAL = 1_000_000
-IMPACT_GAMMA = 0.05
+IMPACT_GAMMA = 0.10
 
 
 async def main():
