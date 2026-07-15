@@ -24,21 +24,21 @@ class PortfolioBacktester:
         self.trade_count = 0
         self.trade_log = []
 
-        # --- Idle-cash yield credit (data-driven addition) ---
-        # compute_metrics()'s Sharpe subtracts risk_free_rate from returns,
-        # which implicitly assumes the capital *not* deployed in the
-        # strategy could otherwise sit in risk-free cash. But process_day
-        # never credited anything on the undeployed fraction of capital --
-        # avg_exposure sits around 0.47, and there were verified multi-week
-        # stretches (900-1100+ consecutive bars) at zero exposure where
-        # Capital didn't move by a cent. That's an inconsistent comparison:
-        # the strategy is judged against a risk-free benchmark it was never
-        # actually given credit for approximating. Charging Borrow_Cost on
-        # the short side without crediting anything on the idle side is the
-        # same asymmetry. risk_free_rate here is deliberately the same
-        # constant compute_metrics() uses, so "strategy vs. cash" is an
-        # apples-to-apples comparison. Set credit_idle_cash=False to
-        # reproduce the old (uncredited) behavior for an A/B comparison.
+                                                               
+                                                                           
+                                                                    
+                                                                         
+                                                                          
+                                                                           
+                                                                       
+                                                                           
+                                                                           
+                                                                          
+                                                                           
+                                                                      
+                                                                       
+                                                                    
+                                                                        
         self.risk_free_rate = risk_free_rate
         self.credit_idle_cash = credit_idle_cash
 
@@ -91,19 +91,19 @@ class PortfolioBacktester:
         notional_traded = self.capital * np.sum(np.abs(delta_w))
         base_fees = float(notional_traded * self.fee_rate) if turnover > 1e-6 else 0.0
 
-        # --- Square-root market impact (data-driven addition) ---
-        # `adv` and `vols` were accepted as parameters here from the start
-        # but never used -- Market_Impact was hardcoded to 0.0 no matter
-        # how large a trade was relative to the asset's own liquidity. This
-        # is the standard square-root impact law: cost scales with the
-        # asset's own volatility and the square root of its participation
-        # rate (notional traded / ADV) for THAT bar's trade in THAT asset.
-        # An asset with missing/zero ADV is floored at $1 rather than
-        # treated as infinitely liquid, so a data gap reads as "assume
-        # illiquid" (conservative) instead of silently free to trade.
-        # `self.gamma` is the calibration constant; it is illustrative here
-        # (not fit to real market-impact data) and should be validated/
-        # recalibrated before being trusted for real capacity decisions.
+                                                                  
+                                                                          
+                                                                        
+                                                                           
+                                                                      
+                                                                         
+                                                                          
+                                                                     
+                                                                      
+                                                                     
+                                                                           
+                                                                       
+                                                                        
         notional_traded_per_asset = self.capital * np.abs(delta_w)
         if turnover > 1e-6 and self.gamma > 0:
             safe_adv = np.where(adv > 1e-6, adv, 1.0)
@@ -119,12 +119,12 @@ class PortfolioBacktester:
 
         total_friction = base_fees + borrow_cost + market_impact
 
-        # Idle-cash yield credit: the capital not deployed by w_prev
-        # (long + short legs both count as "deployed") earns risk_free_rate,
-        # same rate compute_metrics() nets out of the Sharpe ratio. Uses
-        # w_prev (not w_new) since that's the exposure actually carried
-        # *through* this bar -- consistent with how gross_pnl above is
-        # computed off w_prev.
+                                                                    
+                                                                            
+                                                                        
+                                                                       
+                                                                      
+                              
         if self.credit_idle_cash:
             idle_frac = float(np.clip(1.0 - np.abs(w_prev).sum(), 0.0, 1.0))
             cash_yield = self.capital * idle_frac * self.risk_free_rate / self.periods_per_year

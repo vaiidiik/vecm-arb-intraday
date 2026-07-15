@@ -12,9 +12,9 @@ BARS_PER_DAY = 27
 TRADING_DAYS_PER_YEAR = 252
 PERIODS_PER_YEAR = BARS_PER_DAY * TRADING_DAYS_PER_YEAR
 
-# Matched to vecm_main_intraday.py -- was 200*BARS_PER_DAY here, which meant
-# the "live" engine was fitting cointegration on a ~200-day window while the
-# offline backtest used 60 days. Same strategy needs the same window.
+                                                                            
+                                                                            
+                                                                     
 LOOKBACK = 60 * BARS_PER_DAY
 COV_WINDOW = 10 * BARS_PER_DAY
 SPREAD_WINDOW = 20 * BARS_PER_DAY
@@ -27,9 +27,9 @@ SLOT_CAPITAL_FRAC = 0.5
 
 ENABLE_RANK_DROP_EXIT = True
 ENABLE_COINT_STABILITY_EXIT = True
-# Matched to vecm_main_intraday.py -- was 2 here vs 5 there, meaning the live
-# engine would force-liquidate on a rank drop 2.5x faster than the backtest
-# it's supposed to mirror.
+                                                                             
+                                                                           
+                          
 RANK_DROP_CONFIRMATIONS = 5
 COINT_STABILITY_CONFIRMATIONS = 2
 
@@ -130,14 +130,14 @@ class VECMStrategyEngine:
             max_workers=1, thread_name_prefix="vecm_worker"
         )
 
-        # Matched to vecm_main_intraday.py's math_engine exactly. significance
-        # (was 0.01, now 0.05) changes which Johansen critical-value column is
-        # used, and k_ar_diff (was 7, now 3) changes the VAR lag order fed
-        # into coint_johansen -- both actually change the test's output, not
-        # just cosmetic. min_kappa/max_kappa/delay_span are accepted by `vecm`
-        # but never referenced anywhere in vecm_model_intraday.py (dead
-        # parameters); kept here only so the two constructor calls read
-        # identically side by side.
+                                                                              
+                                                                              
+                                                                          
+                                                                            
+                                                                              
+                                                                       
+                                                                       
+                                   
         self.math_engine = vecm(
             significance=0.05,
             entry_threshold=ENTRY_THRESHOLD,
@@ -175,10 +175,10 @@ class VECMStrategyEngine:
             gap_shock_threshold=-0.004,
             enable_gap_shock=False,
         )
-        # `impact_gamma` here now defaults to 0.10 to match vecm_main_intraday.py's
-        # backtester gamma. run_strategy_intraday.py currently passes an explicit
-        # IMPACT_GAMMA=0.05, which would still override this default -- update
-        # that constant too if you want the two to actually match at runtime.
+                                                                                   
+                                                                                 
+                                                                              
+                                                                             
         self.backtester = PortfolioBacktester(
             initial_capital=initial_capital,
             gamma=impact_gamma,

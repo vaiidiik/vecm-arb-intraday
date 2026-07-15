@@ -40,66 +40,66 @@ class dynamic_risk_engine:
         self.periods_per_year = periods_per_year
         self.capital_per_trade_frac = capital_per_trade_frac
 
-        # --- Recommendation #2 ("scale by halflife/stability, not by z") ---
-        # Gate entries on relationship stability instead of moving the raw
-        # entry_threshold (1.7) up or down. `max_entry_halflife` requires a
-        # tighter halflife estimate than the loose generate_all_signals
-        # filter; `min_beta_confirmations` requires the same relationship
-        # (see vecm._signal_key) to have survived N consecutive refits
-        # before it's tradeable. Set max_entry_halflife=None and
-        # min_beta_confirmations=1 to disable these gates.
+                                                                             
+                                                                          
+                                                                           
+                                                                       
+                                                                         
+                                                                      
+                                                                
+                                                          
         self.max_entry_halflife = max_entry_halflife
         self.min_beta_confirmations = min_beta_confirmations
 
-        # --- Recommendation #3 ("preempt instead of a 3rd slot") ---
-        # A candidate can only evict an active slot if: the incumbent has
-        # been held at least preempt_min_holding_bars (no instant churn),
-        # the candidate's |z| clears preempt_z_ratio * entry_threshold
-        # (a standout, e.g. z=8, not a marginal improvement), and its
-        # score beats the incumbent's current score by preempt_quality_margin.
+                                                                     
+                                                                         
+                                                                         
+                                                                      
+                                                                     
+                                                                              
         self.preempt_z_ratio = preempt_z_ratio
         self.preempt_quality_margin = preempt_quality_margin
         self.preempt_min_holding_bars = preempt_min_holding_bars
 
-        # --- Gap-shock exit (data-driven addition) ---
-        # Session-open bars (the first bar after an overnight/weekend gap)
-        # are ~3-4% of all bars but, empirically, account for roughly half
-        # of this strategy's total P&L variance -- essentially every large
-        # single-bar win AND loss sits at a session open. The idea: if a
-        # gap alone already cost a slot more than gap_shock_threshold of
-        # NAV, exit immediately rather than waiting for z-decay.
-        #
-        # DISABLED BY DEFAULT -- tested twice against real backtests, both
-        # times net-negative:
-        #   -0.015 (assumed a slot ~= half the book): fired once in 38,991
-        #     bars, effectively a no-op.
-        #   -0.004 (recalibrated assuming the same half-book split): fired
-        #     50 times -- but avg_exposure sits ~0.4-0.5, meaning usually
-        #     only ONE slot is active at a time, so a slot can realize the
-        #     *entire* portfolio-level gap move, not half of it. The
-        #     threshold ended up ~2x more aggressive than intended, cutting
-        #     ~$227k of trading P&L relative to leaving it off, because gap
-        #     bars carry a real *positive* average edge alongside the
-        #     tail risk (established earlier) -- cutting them early forfeits
-        #     mean-reversion profit more often than it avoids a loss.
-        # Set enable_gap_shock=True to re-enable and keep experimenting,
-        # but recalibrate against per-slot (not portfolio-level) P&L if you
-        # do -- the portfolio-level proxy has now misfired twice.
+                                                       
+                                                                          
+                                                                          
+                                                                          
+                                                                        
+                                                                        
+                                                                
+         
+                                                                          
+                             
+                                                                          
+                                        
+                                                                          
+                                                                         
+                                                                          
+                                                                    
+                                                                           
+                                                                           
+                                                                     
+                                                                            
+                                                                     
+                                                                        
+                                                                           
+                                                                 
         self.gap_shock_threshold = gap_shock_threshold
         self.enable_gap_shock = enable_gap_shock
 
-        # --- Idle-capital / conviction-scaled sizing (data-driven addition) ---
-        # avg_exposure sits ~0.47 with two 50%-of-capital slots -- when only
-        # one slot is filled, the other half of the book earns nothing but
-        # the idle-cash credit in the backtester. Instead of every entry
-        # getting the same flat SLOT_CAPITAL_FRAC regardless of conviction,
-        # conviction_capital_frac() below scales a slot's budget up from 1x
-        # at entry_threshold to conviction_max_scale x at preempt_z_ratio *
-        # entry_threshold (the same "standout" bar should_preempt already
-        # uses) -- but only ever as far as whatever leverage headroom is
-        # actually free that bar, so total gross exposure across all slots
-        # still can never exceed max_leverage. A single standout signal can
-        # now use the whole book instead of being capped at one slot's share.
+                                                                                
+                                                                            
+                                                                          
+                                                                        
+                                                                           
+                                                                           
+                                                                           
+                                                                         
+                                                                        
+                                                                          
+                                                                           
+                                                                             
         self.conviction_max_scale = conviction_max_scale
 
         self.logger = logging.getLogger("VECM_ARB.Risk")
@@ -114,7 +114,7 @@ class dynamic_risk_engine:
         if abs(z) < self.entry_threshold:
             return None
 
-        # Recommendation #2: stability gate instead of scaling the z cutoff.
+                                                                            
         if self.max_entry_halflife is not None and halflife > self.max_entry_halflife:
             return None
         if self.min_beta_confirmations is not None and confirmations < self.min_beta_confirmations:
@@ -161,7 +161,7 @@ class dynamic_risk_engine:
         if abs(z) < self.entry_threshold:
             return alpha
 
-        # Recommendation #2: stability gate instead of scaling the z cutoff.
+                                                                            
         if self.max_entry_halflife is not None and halflife > self.max_entry_halflife:
             return alpha
         if self.min_beta_confirmations is not None and confirmations < self.min_beta_confirmations:

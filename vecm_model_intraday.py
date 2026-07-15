@@ -40,18 +40,18 @@ class vecm:
         self.use_pairwise = use_pairwise
         self.zscore_lookback = zscore_lookback
 
-        # Recommendation #1: default window (in bars) used by
-        # check_cointegration_stability's "has the spread blown out
-        # relative to its recent past" breakdown check.
+                                                             
+                                                                   
+                                                       
         self.coint_stability_window = coint_stability_window
 
-        # Recommendation #2: entries should be gated on relationship
-        # stability, not on moving the z cutoff. `beta_support_tol` sets
-        # how large a beta coefficient must be to count as "this asset
-        # participates in the relationship" when building a stable
-        # identity key for a candidate (see _signal_key). We track how
-        # many consecutive refits confirm the same relationship here,
-        # since generate_all_signals is called once per refit.
+                                                                    
+                                                                        
+                                                                      
+                                                                  
+                                                                      
+                                                                     
+                                                              
         self.beta_support_tol = beta_support_tol
         self._confirmation_history = {}
 
@@ -252,19 +252,19 @@ class vecm:
                     })
 
         if not candidates:
-            # No candidates this refit -- nothing is "confirmed" going
-            # into the next one.
+                                                                      
+                                
             self._confirmation_history = {}
             return []
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
         top = candidates[:3]
 
-        # Recommendation #2: stamp each surviving candidate with how many
-        # consecutive refits (including this one) have produced the same
-        # relationship. A relationship that drops out of the top-3 and
-        # later reappears starts its count over -- that's intentional,
-        # since the point is *consecutive* confirmation.
+                                                                         
+                                                                        
+                                                                      
+                                                                      
+                                                        
         new_history = {}
         for sig in top:
             key = self._signal_key(sig)
