@@ -151,18 +151,14 @@ class VECMStrategyEngine:
 
         self.risk_engine = dynamic_risk_engine(
             num_assets=self.N,
-            aum=initial_capital,
             gamma=0.05,
             entry_threshold=ENTRY_THRESHOLD,
             exit_threshold=EXIT_THRESHOLD,
-            short_exit_threshold=EXIT_THRESHOLD,
             long_exit_threshold=EXIT_THRESHOLD,
             turnover_penalty=0.0005,
             max_leverage=1.0,
             max_weight_per_asset=0.8,
             target_fraction=0.8,
-            volatility_threshold=0.50,
-            periods_per_year=PERIODS_PER_YEAR,
             max_entry_halflife=120,
             min_beta_confirmations=2,
             preempt_z_ratio=2.0,
@@ -180,7 +176,6 @@ class VECMStrategyEngine:
         )
 
         self._historical_prices = []
-        self._historical_returns = []
         self._last_timestamp = None
         self._slots = [_new_slot(self.N) for _ in range(NUM_SLOTS)]
         self._cached_signals = []
@@ -198,8 +193,6 @@ class VECMStrategyEngine:
 
         if len(self._historical_prices) > 1:
             prev = self._historical_prices[-2]
-            ret = (current_prices - prev) / (prev + 1e-12)
-            self._historical_returns.append(float(np.mean(ret)))
             self._stale_streak = np.where(current_prices == prev, self._stale_streak + 1, 0)
         else:
             self._stale_streak = np.zeros(self.N)
@@ -247,7 +240,7 @@ class VECMStrategyEngine:
             spread = log_recent @ bv
             if len(spread) < 20:
                 continue
-            z, mu, sigma = self.math_engine.compute_spread_z(spread, lookback=SPREAD_WINDOW)
+            z, _, sigma = self.math_engine.compute_spread_z(spread, lookback=SPREAD_WINDOW)
             rsi_arr = self.math_engine.compute_rsi(spread)
             rsi = float(rsi_arr[-1]) if len(rsi_arr) > 0 else 50.0
             _, _, macd_hist = self.math_engine.compute_macd(spread)
@@ -299,7 +292,7 @@ class VECMStrategyEngine:
                 frozen_values = s["w"].copy()
                 w_rehedged = self.risk_engine.optimize(
                     np.zeros(self.N), cov_now, s["w"],
-                    adv=current_adv, vols=current_vols, capital_frac=SLOT_CAPITAL_FRAC,
+                    capital_frac=SLOT_CAPITAL_FRAC,
                     frozen_mask=frozen_mask, frozen_values=frozen_values,
                 )
                 if np.abs(w_rehedged).sum() > 1e-6:
@@ -379,7 +372,7 @@ class VECMStrategyEngine:
                     continue
                 w_candidate = self.risk_engine.optimize(
                     alpha_candidate, cov_now, np.zeros(self.N),
-                    adv=current_adv, vols=current_vols, capital_frac=frac,
+                    capital_frac=frac,
                 )
                 if np.abs(w_candidate).sum() > 0.01:
                     chosen = (sig, w_candidate, frac)
@@ -422,7 +415,7 @@ class VECMStrategyEngine:
 
                 w_candidate = self.risk_engine.optimize(
                     alpha_candidate, cov_now, self._slots[weakest_idx]["w"],
-                    adv=current_adv, vols=current_vols, capital_frac=frac,
+                    capital_frac=frac,
                 )
                 if np.abs(w_candidate).sum() <= 0.01:
                     continue

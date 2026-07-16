@@ -170,18 +170,14 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
 
     risk_engine = dynamic_risk_engine(
         num_assets=N,
-        aum=INITIAL_CAPITAL,
         gamma=0.05,
         entry_threshold=ENTRY_THRESHOLD,
         exit_threshold=EXIT_THRESHOLD,
-        short_exit_threshold=EXIT_THRESHOLD,
         long_exit_threshold=EXIT_THRESHOLD,
         turnover_penalty=0.0005,
         max_leverage=1.0,
         max_weight_per_asset=0.8,
         target_fraction=0.8,
-        volatility_threshold=0.50,
-        periods_per_year=PERIODS_PER_YEAR,
         max_entry_halflife=120,
         min_beta_confirmations=2,
         preempt_z_ratio=2.0,
@@ -240,7 +236,7 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
             spread = log_recent @ bv
             if len(spread) < 20:
                 continue
-            z, mu, sigma = math_engine.compute_spread_z(spread, lookback=SPREAD_WINDOW)
+            z, _, sigma = math_engine.compute_spread_z(spread, lookback=SPREAD_WINDOW)
             rsi_arr = math_engine.compute_rsi(spread)
             rsi = float(rsi_arr[-1]) if len(rsi_arr) > 0 else 50.0
             _, _, macd_hist = math_engine.compute_macd(spread)
@@ -290,7 +286,7 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
                 frozen_values = slot["w"].copy()
                 w_rehedged = risk_engine.optimize(
                     np.zeros(N), cov_now, slot["w"],
-                    adv=adv_now, vols=vol_now, capital_frac=SLOT_CAPITAL_FRAC,
+                    capital_frac=SLOT_CAPITAL_FRAC,
                     frozen_mask=frozen_mask, frozen_values=frozen_values,
                 )
                 if np.abs(w_rehedged).sum() > 1e-6:
@@ -368,7 +364,7 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
                     continue
                 w_candidate = risk_engine.optimize(
                     alpha_candidate, cov_now, np.zeros(N),
-                    adv=adv_now, vols=vol_now, capital_frac=frac,
+                    capital_frac=frac,
                 )
                 if np.abs(w_candidate).sum() > 0.01:
                     chosen = (sig, w_candidate, frac)
@@ -410,7 +406,7 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
 
                 w_candidate = risk_engine.optimize(
                     alpha_candidate, cov_now, slots[weakest_idx]["w"],
-                    adv=adv_now, vols=vol_now, capital_frac=frac,
+                    capital_frac=frac,
                 )
                 if np.abs(w_candidate).sum() <= 0.01:
                     continue
