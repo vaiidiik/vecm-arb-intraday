@@ -39,69 +39,14 @@ class dynamic_risk_engine:
         self.trend_threshold = trend_threshold
         self.periods_per_year = periods_per_year
         self.capital_per_trade_frac = capital_per_trade_frac
-
-                                                                             
-                                                                          
-                                                                           
-                                                                       
-                                                                         
-                                                                      
-                                                                
-                                                          
         self.max_entry_halflife = max_entry_halflife
         self.min_beta_confirmations = min_beta_confirmations
-
-                                                                     
-                                                                         
-                                                                         
-                                                                      
-                                                                     
-                                                                              
         self.preempt_z_ratio = preempt_z_ratio
         self.preempt_quality_margin = preempt_quality_margin
         self.preempt_min_holding_bars = preempt_min_holding_bars
-
-                                                       
-                                                                          
-                                                                          
-                                                                          
-                                                                        
-                                                                        
-                                                                
-         
-                                                                          
-                             
-                                                                          
-                                        
-                                                                          
-                                                                         
-                                                                          
-                                                                    
-                                                                           
-                                                                           
-                                                                     
-                                                                            
-                                                                     
-                                                                        
-                                                                           
-                                                                 
         self.gap_shock_threshold = gap_shock_threshold
         self.enable_gap_shock = enable_gap_shock
-
-                                                                                
-                                                                            
-                                                                          
-                                                                        
-                                                                           
-                                                                           
-                                                                           
-                                                                         
-                                                                        
-                                                                          
-                                                                           
-                                                                             
         self.conviction_max_scale = conviction_max_scale
-
         self.logger = logging.getLogger("VECM_ARB.Risk")
 
     def size_from_beta(self, signal, capital_frac):
@@ -113,8 +58,6 @@ class dynamic_risk_engine:
 
         if abs(z) < self.entry_threshold:
             return None
-
-                                                                            
         if self.max_entry_halflife is not None and halflife > self.max_entry_halflife:
             return None
         if self.min_beta_confirmations is not None and confirmations < self.min_beta_confirmations:
@@ -125,7 +68,6 @@ class dynamic_risk_engine:
             macd_confirmed = True
         elif z < -self.entry_threshold and macd_hist > 0:
             macd_confirmed = True
-
         if not macd_confirmed:
             return None
 
@@ -157,11 +99,8 @@ class dynamic_risk_engine:
 
         if abs(z) < self.long_exit_threshold:
             return alpha
-
         if abs(z) < self.entry_threshold:
             return alpha
-
-                                                                            
         if self.max_entry_halflife is not None and halflife > self.max_entry_halflife:
             return alpha
         if self.min_beta_confirmations is not None and confirmations < self.min_beta_confirmations:
@@ -172,7 +111,6 @@ class dynamic_risk_engine:
             macd_confirmed = True
         elif z < -self.entry_threshold and macd_hist > 0:
             macd_confirmed = True
-
         if not macd_confirmed:
             return alpha
 
@@ -185,32 +123,15 @@ class dynamic_risk_engine:
             rsi_boost = 1.0 + min((40 - rsi) / 80.0, 0.3)
 
         direction = -np.sign(z)
-        magnitude = min(abs(z) / 3.0, 1.0) * hl_scale * rsi_boost
+        beta_sum = np.sum(np.abs(beta))
+        if beta_sum < 1e-10:
+            return alpha
+        beta_norm = beta / beta_sum
 
-        alpha = direction * magnitude * beta
-
+        alpha = direction * beta_norm * abs(z) * hl_scale * rsi_boost
         return alpha
 
     def conviction_capital_frac(self, z, base_frac, available_frac, max_scale=None):
-        """
-        Idle-capital fix: instead of handing every qualifying entry the
-        same flat `base_frac` (e.g. SLOT_CAPITAL_FRAC), scale it up when
-        the signal is a standout -- so a really strong opportunity can
-        actually use the capital an empty second slot would otherwise
-        leave idle, rather than being capped at its own slot's share.
-
-        Scaling ramps linearly from 1x at |z| == entry_threshold to
-        `max_scale`x at |z| == preempt_z_ratio * entry_threshold (the same
-        bar should_preempt already treats as "standout"), then holds flat.
-        A marginal entry right at threshold still gets exactly base_frac,
-        same as before this change.
-
-        `available_frac` is the leverage headroom actually free this bar
-        (max_leverage minus gross exposure already committed to other
-        slots) -- the final result is clipped to it, so this can never
-        push total gross exposure over max_leverage no matter how strong
-        the signal is.
-        """
         if base_frac <= 0 or available_frac <= 0:
             return 0.0
 
@@ -228,21 +149,14 @@ class dynamic_risk_engine:
         desired = base_frac * scale
         return float(np.clip(desired, 0.0, available_frac))
 
-    def optimize(self, alpha, cov, w_prev, adv=None, vols=None, capital_frac=None):
-        """
-        Mean-variance sizing: maximize alpha@w - gamma*w'cov*w -
-        turnover_penalty*|w-w_prev|, under the same gross-leverage and
-        per-asset caps `size_from_beta` used -- but splitting the budget
-        by the *actual* covariance structure instead of a flat
-        |beta|-proportional split. `capital_frac` lets a caller size
-        against a specific budget (e.g. a slot's SLOT_CAPITAL_FRAC)
-        instead of the engine-wide capital_per_trade_frac default.
-        """
+    def optimize(self, alpha, cov, w_prev, adv=None, vols=None, capital_frac=None,
+                 frozen_mask=None, frozen_values=None):
         N = self.N
         alpha = np.asarray(alpha, dtype=float)
         w_prev = np.asarray(w_prev, dtype=float)
 
-        if np.abs(alpha).max() < 1e-10:
+        has_frozen = frozen_mask is not None and np.any(frozen_mask)
+        if np.abs(alpha).max() < 1e-10 and not has_frozen:
             return np.zeros(N)
 
         cov_reg = np.array(cov, dtype=float)
@@ -255,6 +169,12 @@ class dynamic_risk_engine:
         eff_leverage = self.max_leverage * frac
         eff_max_wt = self.max_weight_per_asset * frac
 
+        free_idx = np.arange(N)
+        frozen_idx = np.array([], dtype=int)
+        if has_frozen:
+            frozen_idx = np.where(frozen_mask)[0]
+            free_idx = np.where(~frozen_mask)[0]
+
         try:
             w_var = cp.Variable(N)
             ret = alpha @ w_var
@@ -263,11 +183,11 @@ class dynamic_risk_engine:
 
             objective = cp.Maximize(ret - self.gamma * risk - self.turnover_penalty * turnover)
 
-            constraints = [
-                cp.norm1(w_var) <= eff_leverage,
-                w_var >= -eff_max_wt,
-                w_var <= eff_max_wt,
-            ]
+            constraints = [cp.norm1(w_var) <= eff_leverage]
+            if len(free_idx) > 0:
+                constraints += [w_var[free_idx] >= -eff_max_wt, w_var[free_idx] <= eff_max_wt]
+            if len(frozen_idx) > 0:
+                constraints.append(w_var[frozen_idx] == frozen_values[frozen_idx])
 
             prob = cp.Problem(objective, constraints)
 
@@ -277,6 +197,8 @@ class dynamic_risk_engine:
                     if prob.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE] and w_var.value is not None:
                         result = np.array(w_var.value).flatten()
                         result[np.abs(result) < 1e-4] = 0.0
+                        if len(frozen_idx) > 0:
+                            result[frozen_idx] = frozen_values[frozen_idx]
                         return result
                 except Exception:
                     continue
@@ -284,45 +206,58 @@ class dynamic_risk_engine:
         except Exception:
             pass
 
-        return self._fallback_allocation(alpha, w_prev, capital_frac=frac)
+        return self._fallback_allocation(alpha, w_prev, capital_frac=frac,
+                                          frozen_mask=frozen_mask, frozen_values=frozen_values)
 
-    def _fallback_allocation(self, alpha, w_prev, capital_frac=None):
-        alpha_norm = np.abs(alpha).sum()
-        if alpha_norm < 1e-10:
-            return np.zeros(self.N)
-
+    def _fallback_allocation(self, alpha, w_prev, capital_frac=None,
+                              frozen_mask=None, frozen_values=None):
         frac = self.capital_per_trade_frac if capital_frac is None else capital_frac
         eff_leverage = self.max_leverage * frac
         eff_max_wt = self.max_weight_per_asset * frac
 
-        target = alpha / alpha_norm * eff_leverage * self.target_fraction
-        target = np.clip(target, -eff_max_wt, eff_max_wt)
+        if frozen_mask is None:
+            frozen_mask = np.zeros(self.N, dtype=bool)
+        free_mask = ~frozen_mask
 
-        gross = np.abs(target).sum()
-        if gross > eff_leverage:
-            target *= eff_leverage / gross
+        alpha_norm = np.abs(alpha[free_mask]).sum() if np.any(free_mask) else 0.0
+        if alpha_norm < 1e-10 and not np.any(frozen_mask):
+            return np.zeros(self.N)
+
+        target = np.zeros(self.N)
+        if alpha_norm > 1e-10:
+            target[free_mask] = alpha[free_mask] / alpha_norm * eff_leverage * self.target_fraction
+            target[free_mask] = np.clip(target[free_mask], -eff_max_wt, eff_max_wt)
+
+        if np.any(frozen_mask):
+            target[frozen_mask] = frozen_values[frozen_mask]
+
+        frozen_gross = np.abs(target[frozen_mask]).sum() if np.any(frozen_mask) else 0.0
+        remaining_budget = max(0.0, eff_leverage - frozen_gross)
+        free_gross = np.abs(target[free_mask]).sum() if np.any(free_mask) else 0.0
+        if free_gross > remaining_budget and free_gross > 1e-12:
+            target[free_mask] *= remaining_budget / free_gross
 
         max_step = 0.15
         delta = target - w_prev
+        delta[frozen_mask] = 0.0
         delta = np.clip(delta, -max_step, max_step)
         w_new = w_prev + delta
+        w_new[frozen_mask] = frozen_values[frozen_mask]
 
         gross = np.abs(w_new).sum()
-        if gross > eff_leverage:
-            w_new *= eff_leverage / gross
+        if gross > eff_leverage and np.any(free_mask):
+            free_gross_now = np.abs(w_new[free_mask]).sum()
+            if free_gross_now > 1e-12:
+                excess = gross - eff_leverage
+                scale = max(0.0, (free_gross_now - excess) / free_gross_now)
+                w_new[free_mask] *= scale
 
         w_new[np.abs(w_new) < 1e-4] = 0.0
+        w_new[frozen_mask] = frozen_values[frozen_mask]
         return w_new
 
     @staticmethod
     def covariance_from_prices(price_window):
-        """
-        Rolling per-bar return covariance from a (T, N) price window --
-        the real risk input `optimize()` needed and that was previously
-        going unused. Falls back to a small diagonal (independent-asset)
-        matrix if the window is too short to estimate covariance
-        reliably, so callers never have to special-case the cold start.
-        """
         price_window = np.asarray(price_window, dtype=float)
         if price_window.ndim != 2 or price_window.shape[0] < 3:
             n = price_window.shape[1] if price_window.ndim == 2 else 1
@@ -341,18 +276,6 @@ class dynamic_risk_engine:
         return np.atleast_2d(cov)
 
     def should_preempt(self, candidate_sig, weakest_score, weakest_holding_bars):
-        """
-        Recommendation #3 ("the z=8 problem"): instead of adding a 3rd
-        slot, let a much stronger opportunity evict the weakest
-        currently-held slot rather than being skipped outright because
-        both slots happen to already be filled.
-
-        Guarded by:
-          - a minimum holding period on the incumbent (no instant churn)
-          - an absolute z bar well above the entry threshold (only
-            standout opportunities qualify, not marginally-better ones)
-          - a quality margin over the incumbent's current score
-        """
         if weakest_holding_bars is None or weakest_holding_bars < self.preempt_min_holding_bars:
             return False
         if abs(candidate_sig["z"]) < self.preempt_z_ratio * self.entry_threshold:
@@ -365,19 +288,6 @@ class dynamic_risk_engine:
         return candidate_score >= self.preempt_quality_margin * weakest_score
 
     def check_gap_shock(self, bar_ret, is_gap_bar):
-        """
-        Evaluated only on the bar immediately following a >=6h time gap
-        (see GAP_HOURS_THRESHOLD in the caller). `bar_ret` is the slot's
-        return attributable to *just that gap* (current weight x price
-        change from the last bar to this one, as a fraction of NAV). If
-        the gap alone already cost more than gap_shock_threshold, exit now
-        rather than letting a likely-broken relationship keep bleeding
-        until z-decay eventually catches it. Never fires on intraday bars
-        and never fires on gaps that moved in the position's favor.
-
-        Disabled by default -- see the __init__ comment for why (tested
-        twice, net-negative both times).
-        """
         if not self.enable_gap_shock:
             return False
         if not is_gap_bar or bar_ret is None:

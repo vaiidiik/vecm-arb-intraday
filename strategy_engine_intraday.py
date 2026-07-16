@@ -12,9 +12,6 @@ BARS_PER_DAY = 27
 TRADING_DAYS_PER_YEAR = 252
 PERIODS_PER_YEAR = BARS_PER_DAY * TRADING_DAYS_PER_YEAR
 
-                                                                            
-                                                                            
-                                                                     
 LOOKBACK = 60 * BARS_PER_DAY
 COV_WINDOW = 10 * BARS_PER_DAY
 SPREAD_WINDOW = 20 * BARS_PER_DAY
@@ -27,13 +24,14 @@ SLOT_CAPITAL_FRAC = 0.5
 
 ENABLE_RANK_DROP_EXIT = True
 ENABLE_COINT_STABILITY_EXIT = True
-                                                                             
-                                                                           
-                          
 RANK_DROP_CONFIRMATIONS = 5
 COINT_STABILITY_CONFIRMATIONS = 2
 
 GAP_HOURS_THRESHOLD = 6.0
+
+MAKER_TAKER_FEE = 0.0005
+HALT_STALE_BARS = 2
+
 
 def _borrow_rates(assets, adv, vols, periods_per_year=PERIODS_PER_YEAR):
     base_annual = {
@@ -48,6 +46,7 @@ def _borrow_rates(assets, adv, vols, periods_per_year=PERIODS_PER_YEAR):
     annual = annual * (1.0 + 0.25 * vol_stress + 0.15 * liquidity_stress)
     return annual / periods_per_year
 
+
 def _slot_z(beta, log_recent, math_engine, window):
     if beta is None:
         return 0.0
@@ -56,6 +55,7 @@ def _slot_z(beta, log_recent, math_engine, window):
         return 0.0
     z, _, _ = math_engine.compute_spread_z(spread, lookback=window)
     return z
+
 
 def _new_slot(N):
     return {
@@ -73,6 +73,7 @@ def _new_slot(N):
         "_coint_break_streak": 0,
     }
 
+
 def _slot_pnl(slot, p_now):
     if slot["entry_prices"] is None:
         return 0.0
@@ -80,11 +81,13 @@ def _slot_pnl(slot, p_now):
     price_ret = (p_now - slot["entry_prices"]) / safe_entry
     return float(np.dot(slot["entry_w"], price_ret))
 
+
 def _slot_bar_return(slot, p_prev, p_now):
     if slot["w"] is None:
         return 0.0
     safe_prev = np.where(p_prev > 0, p_prev, 1.0)
     return float(np.dot(slot["w"], (p_now - p_prev) / safe_prev))
+
 
 def _gap_hours(ts_now, ts_prev):
     if ts_prev is None:
@@ -93,6 +96,7 @@ def _gap_hours(ts_now, ts_prev):
         return (ts_now - ts_prev).total_seconds() / 3600.0
     except (TypeError, AttributeError):
         return 0.0
+
 
 def _reset_slot(slot, N):
     slot["w"] = np.zeros(N)
@@ -107,6 +111,7 @@ def _reset_slot(slot, N):
     slot["_rank_zero_streak"] = 0
     slot["_coint_break_streak"] = 0
 
+
 def _enter_slot(slot, sig, w_new, t, p_now):
     slot["w"] = w_new
     slot["holding_start"] = t
@@ -120,6 +125,7 @@ def _enter_slot(slot, sig, w_new, t, p_now):
     slot["_rank_zero_streak"] = 0
     slot["_coint_break_streak"] = 0
 
+
 class VECMStrategyEngine:
     def __init__(self, assets, initial_capital=1_000_000, impact_gamma=0.10):
         self.assets = list(assets)
@@ -130,14 +136,6 @@ class VECMStrategyEngine:
             max_workers=1, thread_name_prefix="vecm_worker"
         )
 
-                                                                              
-                                                                              
-                                                                          
-                                                                            
-                                                                              
-                                                                       
-                                                                       
-                                   
         self.math_engine = vecm(
             significance=0.05,
             entry_threshold=ENTRY_THRESHOLD,
@@ -165,24 +163,19 @@ class VECMStrategyEngine:
             target_fraction=0.8,
             volatility_threshold=0.50,
             periods_per_year=PERIODS_PER_YEAR,
-
             max_entry_halflife=120,
             min_beta_confirmations=2,
-
             preempt_z_ratio=2.0,
             preempt_quality_margin=1.4,
             preempt_min_holding_bars=10,
             gap_shock_threshold=-0.004,
             enable_gap_shock=False,
         )
-                                                                                   
-                                                                                 
-                                                                              
-                                                                             
+
         self.backtester = PortfolioBacktester(
             initial_capital=initial_capital,
             gamma=impact_gamma,
-            maker_taker_fee=0.0,
+            maker_taker_fee=MAKER_TAKER_FEE,
             periods_per_year=PERIODS_PER_YEAR,
         )
 
@@ -192,6 +185,7 @@ class VECMStrategyEngine:
         self._slots = [_new_slot(self.N) for _ in range(NUM_SLOTS)]
         self._cached_signals = []
         self._bar_count = 0
+        self._stale_streak = np.zeros(self.N)
 
         self._trade_log = []
 
@@ -206,6 +200,11 @@ class VECMStrategyEngine:
             prev = self._historical_prices[-2]
             ret = (current_prices - prev) / (prev + 1e-12)
             self._historical_returns.append(float(np.mean(ret)))
+            self._stale_streak = np.where(current_prices == prev, self._stale_streak + 1, 0)
+        else:
+            self._stale_streak = np.zeros(self.N)
+
+        halted_mask = self._stale_streak >= HALT_STALE_BARS
 
         if len(self._historical_prices) < LOOKBACK:
             return
@@ -263,7 +262,6 @@ class VECMStrategyEngine:
                 "macd_hist": macd_hist,
                 "pair": sig.get("pair"),
                 "rank": sig.get("rank", 1),
-
                 "confirmations": sig.get("confirmations", 1),
                 "score": abs(z) / max(halflife_sig, 1.0),
             })
@@ -282,12 +280,37 @@ class VECMStrategyEngine:
         for s in self._slots:
             s["_was_flat"] = np.abs(s["w"]).sum() < 0.01
 
+        cov_start = max(0, len(self._historical_prices) - COV_WINDOW)
+        cov_now = self.risk_engine.covariance_from_prices(
+            np.array(self._historical_prices[cov_start:], dtype=float)
+        )
+
         slot_quality = {}
 
         for slot_idx, s in enumerate(self._slots):
             gross_s = np.abs(s["w"]).sum()
             if gross_s <= 0.01:
                 continue
+
+            held_idx = np.where(np.abs(s["w"]) > 1e-6)[0]
+            if np.any(halted_mask[held_idx]):
+                frozen_mask = np.zeros(self.N, dtype=bool)
+                frozen_mask[held_idx[halted_mask[held_idx]]] = True
+                frozen_values = s["w"].copy()
+                w_rehedged = self.risk_engine.optimize(
+                    np.zeros(self.N), cov_now, s["w"],
+                    adv=current_adv, vols=current_vols, capital_frac=SLOT_CAPITAL_FRAC,
+                    frozen_mask=frozen_mask, frozen_values=frozen_values,
+                )
+                if np.abs(w_rehedged).sum() > 1e-6:
+                    s["w"] = w_rehedged
+                self._trade_log.append({
+                    "timestamp": timestamp, "slot": slot_idx, "event": "halt_rehedge",
+                    "reason": "asset_halted",
+                    "holding_bars": t - s["holding_start"] if s["holding_start"] is not None else 0,
+                    "pnl_since_entry": _slot_pnl(s, current_prices),
+                    "entry_z": s.get("entry_z"), "exit_z": None,
+                })
 
             holding_bars = t - s["holding_start"]
             pnl_since_entry = _slot_pnl(s, current_prices)
@@ -327,11 +350,6 @@ class VECMStrategyEngine:
                     "holding_bars": holding_bars,
                 }
 
-        cov_start = max(0, len(self._historical_prices) - COV_WINDOW)
-        cov_now = self.risk_engine.covariance_from_prices(
-            np.array(self._historical_prices[cov_start:], dtype=float)
-        )
-
         used_signatures = set()
         for s in self._slots:
             if np.abs(s["w"]).sum() > 0.01 and s["active_beta"] is not None:
@@ -345,6 +363,8 @@ class VECMStrategyEngine:
             for sig in live_signals:
                 sig_key = tuple(np.round(sig["beta_full"], 6))
                 if sig_key in used_signatures:
+                    continue
+                if np.any(np.abs(sig["beta_full"][halted_mask]) > 1e-8):
                     continue
                 alpha_candidate = self.risk_engine.compute_alpha([sig], self.N)
                 if np.abs(alpha_candidate).max() < 1e-10:
@@ -384,6 +404,8 @@ class VECMStrategyEngine:
             for sig in live_signals:
                 sig_key = tuple(np.round(sig["beta_full"], 6))
                 if sig_key in used_signatures:
+                    continue
+                if np.any(np.abs(sig["beta_full"][halted_mask]) > 1e-8):
                     continue
                 if not self.risk_engine.should_preempt(sig, weakest["score"], weakest["holding_bars"]):
                     continue

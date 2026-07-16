@@ -38,6 +38,10 @@ COINT_STABILITY_CONFIRMATIONS = 2
 
 GAP_HOURS_THRESHOLD = 6.0
 
+MAKER_TAKER_FEE = 0.0005
+HALT_STALE_BARS = 2
+
+
 def _borrow_rates(assets, adv, vols):
     base_annual = {
         "JPM": 0.0030, "BAC": 0.0035, "C": 0.0050,
@@ -51,6 +55,7 @@ def _borrow_rates(assets, adv, vols):
     annual = annual * (1.0 + 0.25 * vol_stress + 0.15 * liquidity_stress)
     return annual / PERIODS_PER_YEAR
 
+
 def _slot_z(beta, log_recent, math_engine, window):
     if beta is None:
         return 0.0
@@ -59,6 +64,7 @@ def _slot_z(beta, log_recent, math_engine, window):
         return 0.0
     z, _, _ = math_engine.compute_spread_z(spread, lookback=window)
     return z
+
 
 def _new_slot(N):
     return {
@@ -76,6 +82,7 @@ def _new_slot(N):
         "_coint_break_streak": 0,
     }
 
+
 def _slot_pnl(slot, p_now):
     if slot["entry_prices"] is None:
         return 0.0
@@ -83,11 +90,13 @@ def _slot_pnl(slot, p_now):
     price_ret = (p_now - slot["entry_prices"]) / safe_entry
     return float(np.dot(slot["entry_w"], price_ret))
 
+
 def _slot_bar_return(slot, p_prev, p_now):
     if slot["w"] is None:
         return 0.0
     safe_prev = np.where(p_prev > 0, p_prev, 1.0)
     return float(np.dot(slot["w"], (p_now - p_prev) / safe_prev))
+
 
 def _gap_hours(ts_now, ts_prev):
     if ts_prev is None:
@@ -96,6 +105,7 @@ def _gap_hours(ts_now, ts_prev):
         return (ts_now - ts_prev).total_seconds() / 3600.0
     except (TypeError, AttributeError):
         return 0.0
+
 
 def _reset_slot(slot, N):
     slot["w"] = np.zeros(N)
@@ -110,6 +120,7 @@ def _reset_slot(slot, N):
     slot["_rank_zero_streak"] = 0
     slot["_coint_break_streak"] = 0
 
+
 def _enter_slot(slot, sig, w_new, t, p_now):
     slot["w"] = w_new
     slot["holding_start"] = t
@@ -123,19 +134,14 @@ def _enter_slot(slot, sig, w_new, t, p_now):
     slot["_rank_zero_streak"] = 0
     slot["_coint_break_streak"] = 0
 
-def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    prices_path = os.path.join(script_dir, "sample_prices_intraday.csv")
-    adv_path = os.path.join(script_dir, "sample_dollar_adv_intraday.csv")
 
-    print("Loading data...")
-    prices_df = pd.read_csv(prices_path, index_col="Date", parse_dates=True)
-    adv_df = pd.read_csv(adv_path, index_col="Date", parse_dates=True)
+def _update_halt_state(stale_streak, p_prev, p_now):
+    stale_streak = np.where(p_now == p_prev, stale_streak + 1, 0)
+    halted_mask = stale_streak >= HALT_STALE_BARS
+    return stale_streak, halted_mask
 
-    assets = [a for a in PREFERRED_ASSETS if a in prices_df.columns]
-    if len(assets) < 2:
-        raise ValueError("Need at least two available assets.")
 
+def generate_weight_trajectory(prices_df, adv_df, assets):
     prices_df = prices_df[assets]
     adv_df = adv_df[assets]
     returns_df = prices_df.pct_change().fillna(0)
@@ -147,11 +153,7 @@ def main():
     prices_all = prices_df.values
     adv_all = adv_df.values
     vols_all = vols_df.values
-    returns_all = returns_df.values
     dates = prices_df.index
-
-    print(f"Assets: {assets}")
-    print(f"Total bars: {T}, Lookback: {LOOKBACK}, Trading bars: {T - LOOKBACK}")
 
     math_engine = vecm(
         significance=0.05,
@@ -180,10 +182,8 @@ def main():
         target_fraction=0.8,
         volatility_threshold=0.50,
         periods_per_year=PERIODS_PER_YEAR,
-
         max_entry_halflife=120,
         min_beta_confirmations=2,
-
         preempt_z_ratio=2.0,
         preempt_quality_margin=1.4,
         preempt_min_holding_bars=10,
@@ -191,22 +191,9 @@ def main():
         enable_gap_shock=False,
     )
 
-    backtester = PortfolioBacktester(
-        initial_capital=INITIAL_CAPITAL,
-
-        gamma=0.10,
-        maker_taker_fee=0.0,
-        periods_per_year=PERIODS_PER_YEAR,
-    )
-
     slots = [_new_slot(N) for _ in range(NUM_SLOTS)]
-
     cached_signals = []
-    exit_log = []
-
-    print("Starting backtest...")
-    t0 = time.time()
-    refit_count = 0
+    stale_streak = np.zeros(N)
 
     for t in range(LOOKBACK, T):
         date = dates[t]
@@ -219,10 +206,13 @@ def main():
         gap_hours = _gap_hours(date, dates[t - 1] if t > 0 else None)
         is_gap_bar = gap_hours >= GAP_HOURS_THRESHOLD
 
+        stale_streak, halted_mask = _update_halt_state(stale_streak, p_prev, p_now)
+
+        events = []
+
         if bars_since_start % REFIT_INTERVAL == 0 or not cached_signals:
             log_window = log_prices_all[t - LOOKBACK:t]
             cached_signals = math_engine.generate_all_signals(log_window, N)
-            refit_count += 1
 
             for slot in slots:
                 if np.abs(slot["w"]).sum() <= 0.01:
@@ -265,7 +255,6 @@ def main():
                 "macd_hist": macd_hist,
                 "pair": sig.get("pair"),
                 "rank": sig.get("rank", 1),
-
                 "confirmations": sig.get("confirmations", 1),
                 "score": abs(z) / max(halflife_sig, 1.0),
             })
@@ -284,12 +273,34 @@ def main():
         for slot in slots:
             slot["_was_flat"] = np.abs(slot["w"]).sum() < 0.01
 
+        cov_start = max(0, t - COV_WINDOW)
+        cov_now = risk_engine.covariance_from_prices(prices_all[cov_start:t + 1])
+
         slot_quality = {}
 
         for slot_idx, slot in enumerate(slots):
             gross_s = np.abs(slot["w"]).sum()
             if gross_s <= 0.01:
                 continue
+
+            held_idx = np.where(np.abs(slot["w"]) > 1e-6)[0]
+            if np.any(halted_mask[held_idx]):
+                frozen_mask = np.zeros(N, dtype=bool)
+                frozen_mask[held_idx[halted_mask[held_idx]]] = True
+                frozen_values = slot["w"].copy()
+                w_rehedged = risk_engine.optimize(
+                    np.zeros(N), cov_now, slot["w"],
+                    adv=adv_now, vols=vol_now, capital_frac=SLOT_CAPITAL_FRAC,
+                    frozen_mask=frozen_mask, frozen_values=frozen_values,
+                )
+                if np.abs(w_rehedged).sum() > 1e-6:
+                    slot["w"] = w_rehedged
+                events.append({
+                    "date": date, "slot": slot_idx, "event": "halt_rehedge", "reason": "asset_halted",
+                    "holding_bars": t - slot["holding_start"] if slot["holding_start"] is not None else 0,
+                    "pnl_since_entry": _slot_pnl(slot, p_now),
+                    "entry_z": slot.get("entry_z"), "exit_z": None,
+                })
 
             holding_bars = t - slot["holding_start"]
             pnl_since_entry = _slot_pnl(slot, p_now)
@@ -315,7 +326,7 @@ def main():
                 exit_reason = "gap_shock"
 
             if exit_reason is not None:
-                exit_log.append({
+                events.append({
                     "date": date, "slot": slot_idx, "event": "exit", "reason": exit_reason,
                     "holding_bars": holding_bars, "pnl_since_entry": pnl_since_entry,
                     "entry_z": slot.get("entry_z"), "exit_z": z_slot,
@@ -333,9 +344,6 @@ def main():
             if np.abs(slot["w"]).sum() > 0.01 and slot["active_beta"] is not None:
                 used_signatures.add(tuple(np.round(slot["active_beta"], 6)))
 
-        cov_start = max(0, t - COV_WINDOW)
-        cov_now = risk_engine.covariance_from_prices(prices_all[cov_start:t + 1])
-
         for slot_idx, slot in enumerate(slots):
             if not slot["_was_flat"] or np.abs(slot["w"]).sum() > 0.01:
                 continue
@@ -344,6 +352,8 @@ def main():
             for sig in live_signals:
                 sig_key = tuple(np.round(sig["beta_full"], 6))
                 if sig_key in used_signatures:
+                    continue
+                if np.any(np.abs(sig["beta_full"][halted_mask]) > 1e-8):
                     continue
                 alpha_candidate = risk_engine.compute_alpha([sig], N)
                 if np.abs(alpha_candidate).max() < 1e-10:
@@ -368,7 +378,7 @@ def main():
                 sig, w_new, frac = chosen
                 _enter_slot(slot, sig, w_new, t, p_now)
                 used_signatures.add(tuple(np.round(sig["beta_full"], 6)))
-                exit_log.append({
+                events.append({
                     "date": date, "slot": slot_idx, "event": "entry", "reason": "signal_entry",
                     "holding_bars": 0, "pnl_since_entry": 0.0,
                     "entry_z": sig["z"], "exit_z": None, "capital_frac": round(frac, 4),
@@ -382,6 +392,8 @@ def main():
             for sig in live_signals:
                 sig_key = tuple(np.round(sig["beta_full"], 6))
                 if sig_key in used_signatures:
+                    continue
+                if np.any(np.abs(sig["beta_full"][halted_mask]) > 1e-8):
                     continue
                 if not risk_engine.should_preempt(sig, weakest["score"], weakest["holding_bars"]):
                     continue
@@ -405,7 +417,7 @@ def main():
 
                 slot = slots[weakest_idx]
                 evicted_pnl = _slot_pnl(slot, p_now)
-                exit_log.append({
+                events.append({
                     "date": date, "slot": weakest_idx, "event": "exit", "reason": "preempted",
                     "holding_bars": weakest["holding_bars"], "pnl_since_entry": evicted_pnl,
                     "entry_z": slot.get("entry_z"), "exit_z": weakest["z"],
@@ -413,7 +425,7 @@ def main():
 
                 _enter_slot(slot, sig, w_candidate, t, p_now)
                 used_signatures.add(sig_key)
-                exit_log.append({
+                events.append({
                     "date": date, "slot": weakest_idx, "event": "entry", "reason": "preempt_entry",
                     "holding_bars": 0, "pnl_since_entry": 0.0,
                     "entry_z": sig["z"], "exit_z": None, "capital_frac": round(frac, 4),
@@ -421,25 +433,72 @@ def main():
                 break
 
         total_w_new = sum((slot["w"] for slot in slots), np.zeros(N))
-
         borrow = _borrow_rates(assets, adv_now, vol_now)
 
-        backtester.process_day(
-            date, total_w_prev, total_w_new, p_prev, p_now, adv_now, vol_now,
-            z_primary, rank_primary, borrow
-        )
+        yield {
+            "date": date,
+            "w_prev": total_w_prev,
+            "w_new": total_w_new,
+            "prices_prev": p_prev,
+            "prices_new": p_now,
+            "adv": adv_now,
+            "vols": vol_now,
+            "z_score": z_primary,
+            "rank": rank_primary,
+            "borrow": borrow,
+            "events": events,
+            "bars_since_start": bars_since_start,
+            "total_bars": T - LOOKBACK,
+        }
 
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    prices_path = os.path.join(script_dir, "sample_prices_intraday.csv")
+    adv_path = os.path.join(script_dir, "sample_dollar_adv_intraday.csv")
+
+    print("Loading data...")
+    prices_df = pd.read_csv(prices_path, index_col="Date", parse_dates=True)
+    adv_df = pd.read_csv(adv_path, index_col="Date", parse_dates=True)
+
+    assets = [a for a in PREFERRED_ASSETS if a in prices_df.columns]
+    if len(assets) < 2:
+        raise ValueError("Need at least two available assets.")
+
+    print(f"Assets: {assets}")
+    print(f"Total bars: {len(prices_df)}, Lookback: {LOOKBACK}")
+
+    backtester = PortfolioBacktester(
+        initial_capital=INITIAL_CAPITAL,
+        gamma=0.10,
+        maker_taker_fee=MAKER_TAKER_FEE,
+        periods_per_year=PERIODS_PER_YEAR,
+    )
+
+    exit_log = []
+    print("Starting backtest...")
+    t0 = time.time()
+
+    for record in generate_weight_trajectory(prices_df, adv_df, assets):
+        backtester.process_day(
+            record["date"], record["w_prev"], record["w_new"],
+            record["prices_prev"], record["prices_new"],
+            record["adv"], record["vols"],
+            record["z_score"], record["rank"], record["borrow"],
+        )
+        exit_log.extend(record["events"])
+
+        bars_since_start = record["bars_since_start"]
         if bars_since_start > 0 and bars_since_start % (BARS_PER_DAY * 50) == 0:
             elapsed = time.time() - t0
-            pct = bars_since_start / (T - LOOKBACK) * 100
-            print(f"  {pct:.0f}% done ({bars_since_start}/{T - LOOKBACK}) | "
+            pct = bars_since_start / record["total_bars"] * 100
+            print(f"  {pct:.0f}% done ({bars_since_start}/{record['total_bars']}) | "
                   f"Capital: ${backtester.capital:,.0f} | "
                   f"Trades: {backtester.trade_count} | "
                   f"Time: {elapsed:.1f}s")
 
     elapsed = time.time() - t0
     print(f"\nBacktest complete in {elapsed:.1f}s")
-    print(f"Refits: {refit_count}")
 
     out_daily = os.path.join(script_dir, "backtest_intraday.csv")
     out_metrics = os.path.join(script_dir, "performance_metrics_intraday.csv")
@@ -462,6 +521,6 @@ def main():
     for k, v in metrics.items():
         print(f"  {k:20s}: {v}")
 
+
 if __name__ == "__main__":
     main()
-
