@@ -39,19 +39,7 @@ class vecm:
         self.macd_signal = macd_signal
         self.use_pairwise = use_pairwise
         self.zscore_lookback = zscore_lookback
-
-                                                             
-                                                                   
-                                                       
         self.coint_stability_window = coint_stability_window
-
-                                                                    
-                                                                        
-                                                                      
-                                                                  
-                                                                      
-                                                                     
-                                                              
         self.beta_support_tol = beta_support_tol
         self._confirmation_history = {}
 
@@ -165,18 +153,6 @@ class vecm:
         return float(z), float(mu), float(sigma)
 
     def _signal_key(self, sig):
-        """
-        Stable identity for a candidate relationship, used to count how
-        many consecutive refits have confirmed it (recommendation #2:
-        gate entries on stability rather than on the raw z cutoff).
-
-        Pairwise signals are keyed on the (sorted) asset pair, which is
-        exact and refit-invariant. Multivariate signals are keyed on the
-        rank and the *support* of the beta vector (which assets carry a
-        non-negligible weight) rather than the exact coefficients, since
-        those coefficients can drift slightly between refits even when
-        it's "the same" cointegrating relationship.
-        """
         if sig.get("pair") is not None:
             return ("pair",) + tuple(sorted(sig["pair"]))
         bv = np.asarray(sig["beta_full"])
@@ -252,19 +228,12 @@ class vecm:
                     })
 
         if not candidates:
-                                                                      
-                                
             self._confirmation_history = {}
             return []
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
         top = candidates[:3]
 
-                                                                         
-                                                                        
-                                                                      
-                                                                      
-                                                        
         new_history = {}
         for sig in top:
             key = self._signal_key(sig)

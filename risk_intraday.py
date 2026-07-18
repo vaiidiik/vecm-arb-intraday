@@ -1,16 +1,21 @@
 import numpy as np
 import cvxpy as cp
+import logging
 
 
 class dynamic_risk_engine:
-    def __init__(self, num_assets, gamma=0.05,
+    def __init__(self, num_assets, aum, gamma=0.05,
                  entry_threshold=1.5,
                  exit_threshold=0.3,
+                 short_exit_threshold=0.3,
                  long_exit_threshold=None,
                  max_leverage=1.0,
                  target_fraction=0.8,
                  max_weight_per_asset=0.45,
                  turnover_penalty=0.0005,
+                 volatility_threshold=0.50,
+                 trend_threshold=0.30,
+                 periods_per_year=6804,
                  capital_per_trade_frac=0.20,
                  max_entry_halflife=120,
                  min_beta_confirmations=2,
@@ -21,13 +26,18 @@ class dynamic_risk_engine:
                  enable_gap_shock=False,
                  conviction_max_scale=2.0):
         self.N = num_assets
+        self.aum = aum
         self.gamma = gamma
         self.entry_threshold = entry_threshold
         self.long_exit_threshold = exit_threshold if long_exit_threshold is None else long_exit_threshold
+        self.short_exit_threshold = short_exit_threshold
         self.max_leverage = max_leverage
         self.target_fraction = target_fraction
         self.max_weight_per_asset = max_weight_per_asset
         self.turnover_penalty = turnover_penalty
+        self.volatility_threshold = volatility_threshold
+        self.trend_threshold = trend_threshold
+        self.periods_per_year = periods_per_year
         self.capital_per_trade_frac = capital_per_trade_frac
         self.max_entry_halflife = max_entry_halflife
         self.min_beta_confirmations = min_beta_confirmations
@@ -37,8 +47,44 @@ class dynamic_risk_engine:
         self.gap_shock_threshold = gap_shock_threshold
         self.enable_gap_shock = enable_gap_shock
         self.conviction_max_scale = conviction_max_scale
+        self.logger = logging.getLogger("VECM_ARB.Risk")
 
-    def compute_alpha(self, signals, n_assets):
+    def size_from_beta(self, signal, capital_frac):
+        z = signal["z"]
+        beta = signal["beta_full"]
+        macd_hist = signal.get("macd_hist", 0.0)
+        halflife = signal.get("halflife", 50.0)
+        confirmations = signal.get("confirmations", 1)
+
+        if abs(z) < self.entry_threshold:
+            return None
+        if self.max_entry_halflife is not None and halflife > self.max_entry_halflife:
+            return None
+        if self.min_beta_confirmations is not None and confirmations < self.min_beta_confirmations:
+            return None
+
+        macd_confirmed = False
+        if z > self.entry_threshold and macd_hist < 0:
+            macd_confirmed = True
+        elif z < -self.entry_threshold and macd_hist > 0:
+            macd_confirmed = True
+        if not macd_confirmed:
+            return None
+
+        beta_sum = np.sum(np.abs(beta))
+        if beta_sum < 1e-10:
+            return None
+
+        beta_norm = beta / beta_sum
+        direction = -np.sign(z)
+        gross_budget = self.max_leverage * capital_frac
+        w = direction * beta_norm * gross_budget
+
+        max_wt = self.max_weight_per_asset * capital_frac
+        w = np.clip(w, -max_wt, max_wt)
+        return w
+
+    def compute_alpha(self, signals, n_assets, current_position=None):
         alpha = np.zeros(n_assets)
         if not signals:
             return alpha
@@ -77,12 +123,9 @@ class dynamic_risk_engine:
             rsi_boost = 1.0 + min((40 - rsi) / 80.0, 0.3)
 
         direction = -np.sign(z)
-        beta_sum = np.sum(np.abs(beta))
-        if beta_sum < 1e-10:
-            return alpha
-        beta_norm = beta / beta_sum
+        magnitude = min(abs(z) / 3.0, 1.0) * hl_scale * rsi_boost
 
-        alpha = direction * beta_norm * abs(z) * hl_scale * rsi_boost
+        alpha = direction * magnitude * beta
         return alpha
 
     def conviction_capital_frac(self, z, base_frac, available_frac, max_scale=None):
@@ -103,7 +146,7 @@ class dynamic_risk_engine:
         desired = base_frac * scale
         return float(np.clip(desired, 0.0, available_frac))
 
-    def optimize(self, alpha, cov, w_prev, capital_frac=None,
+    def optimize(self, alpha, cov, w_prev, adv=None, vols=None, capital_frac=None,
                  frozen_mask=None, frozen_values=None):
         N = self.N
         alpha = np.asarray(alpha, dtype=float)

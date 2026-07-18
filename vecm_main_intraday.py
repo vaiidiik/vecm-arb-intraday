@@ -3,6 +3,7 @@ import os
 import logging
 import numpy as np
 import pandas as pd
+import pandas_market_calendars as mcal
 
 from vecm_model_intraday import vecm
 from risk_intraday import dynamic_risk_engine
@@ -31,8 +32,8 @@ REFIT_INTERVAL = BARS_PER_DAY
 NUM_SLOTS = 2
 SLOT_CAPITAL_FRAC = 0.5
 
-ENABLE_RANK_DROP_EXIT = True
-ENABLE_COINT_STABILITY_EXIT = True
+ENABLE_RANK_DROP_EXIT = False
+ENABLE_COINT_STABILITY_EXIT = False
 RANK_DROP_CONFIRMATIONS = 5
 COINT_STABILITY_CONFIRMATIONS = 2
 
@@ -40,6 +41,39 @@ GAP_HOURS_THRESHOLD = 6.0
 
 MAKER_TAKER_FEE = 0.0005
 HALT_STALE_BARS = 2
+
+EARLY_CLOSE_MAX_SESSION_HOURS = 6.4
+EARLY_CLOSE_CALENDAR_START = "2015-01-01"
+EARLY_CLOSE_CALENDAR_END = "2035-12-31"
+
+
+def _build_early_close_cutoffs():
+    nyse = mcal.get_calendar("NYSE")
+    sched = nyse.schedule(start_date=EARLY_CLOSE_CALENDAR_START, end_date=EARLY_CLOSE_CALENDAR_END)
+    session_hours = (sched["market_close"] - sched["market_open"]).dt.total_seconds() / 3600.0
+    early = sched[session_hours < EARLY_CLOSE_MAX_SESSION_HOURS]
+    close_et = early["market_close"].dt.tz_convert("US/Eastern")
+    return {ts.date(): ts.time() for ts in close_et}
+
+
+EARLY_CLOSE_CUTOFFS = _build_early_close_cutoffs()
+
+
+def _is_post_early_close(timestamp):
+    ts = pd.Timestamp(timestamp)
+    ts_et = ts.tz_convert("US/Eastern") if ts.tzinfo is not None else ts.tz_localize("UTC").tz_convert("US/Eastern")
+    cutoff = EARLY_CLOSE_CUTOFFS.get(ts_et.date())
+    if cutoff is None:
+        return False
+    return ts_et.time() > cutoff
+
+
+def _update_halt_state(stale_streak, p_prev, p_now, timestamp):
+    if _is_post_early_close(timestamp):
+        return np.zeros_like(stale_streak), np.zeros_like(stale_streak, dtype=bool)
+    stale_streak = np.where(p_now == p_prev, stale_streak + 1, 0)
+    halted_mask = stale_streak >= HALT_STALE_BARS
+    return stale_streak, halted_mask
 
 
 def _borrow_rates(assets, adv, vols):
@@ -135,12 +169,6 @@ def _enter_slot(slot, sig, w_new, t, p_now):
     slot["_coint_break_streak"] = 0
 
 
-def _update_halt_state(stale_streak, p_prev, p_now):
-    stale_streak = np.where(p_now == p_prev, stale_streak + 1, 0)
-    halted_mask = stale_streak >= HALT_STALE_BARS
-    return stale_streak, halted_mask
-
-
 def generate_weight_trajectory(prices_df, adv_df, assets):
     prices_df = prices_df[assets]
     adv_df = adv_df[assets]
@@ -170,14 +198,18 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
 
     risk_engine = dynamic_risk_engine(
         num_assets=N,
+        aum=INITIAL_CAPITAL,
         gamma=0.05,
         entry_threshold=ENTRY_THRESHOLD,
         exit_threshold=EXIT_THRESHOLD,
+        short_exit_threshold=EXIT_THRESHOLD,
         long_exit_threshold=EXIT_THRESHOLD,
         turnover_penalty=0.0005,
         max_leverage=1.0,
         max_weight_per_asset=0.8,
         target_fraction=0.8,
+        volatility_threshold=0.50,
+        periods_per_year=PERIODS_PER_YEAR,
         max_entry_halflife=120,
         min_beta_confirmations=2,
         preempt_z_ratio=2.0,
@@ -201,8 +233,7 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
         bars_since_start = t - LOOKBACK
         gap_hours = _gap_hours(date, dates[t - 1] if t > 0 else None)
         is_gap_bar = gap_hours >= GAP_HOURS_THRESHOLD
-
-        stale_streak, halted_mask = _update_halt_state(stale_streak, p_prev, p_now)
+        stale_streak, halted_mask = _update_halt_state(stale_streak, p_prev, p_now, date)
 
         events = []
 
@@ -236,7 +267,7 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
             spread = log_recent @ bv
             if len(spread) < 20:
                 continue
-            z, _, sigma = math_engine.compute_spread_z(spread, lookback=SPREAD_WINDOW)
+            z, mu, sigma = math_engine.compute_spread_z(spread, lookback=SPREAD_WINDOW)
             rsi_arr = math_engine.compute_rsi(spread)
             rsi = float(rsi_arr[-1]) if len(rsi_arr) > 0 else 50.0
             _, _, macd_hist = math_engine.compute_macd(spread)
@@ -269,10 +300,10 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
         for slot in slots:
             slot["_was_flat"] = np.abs(slot["w"]).sum() < 0.01
 
+        slot_quality = {}
+
         cov_start = max(0, t - COV_WINDOW)
         cov_now = risk_engine.covariance_from_prices(prices_all[cov_start:t + 1])
-
-        slot_quality = {}
 
         for slot_idx, slot in enumerate(slots):
             gross_s = np.abs(slot["w"]).sum()
@@ -364,7 +395,7 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
                     continue
                 w_candidate = risk_engine.optimize(
                     alpha_candidate, cov_now, np.zeros(N),
-                    capital_frac=frac,
+                    adv=adv_now, vols=vol_now, capital_frac=frac,
                 )
                 if np.abs(w_candidate).sum() > 0.01:
                     chosen = (sig, w_candidate, frac)
@@ -406,7 +437,7 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
 
                 w_candidate = risk_engine.optimize(
                     alpha_candidate, cov_now, slots[weakest_idx]["w"],
-                    capital_frac=frac,
+                    adv=adv_now, vols=vol_now, capital_frac=frac,
                 )
                 if np.abs(w_candidate).sum() <= 0.01:
                     continue
@@ -429,6 +460,7 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
                 break
 
         total_w_new = sum((slot["w"] for slot in slots), np.zeros(N))
+
         borrow = _borrow_rates(assets, adv_now, vol_now)
 
         yield {
@@ -462,7 +494,7 @@ def main():
         raise ValueError("Need at least two available assets.")
 
     print(f"Assets: {assets}")
-    print(f"Total bars: {len(prices_df)}, Lookback: {LOOKBACK}")
+    print(f"Total bars: {len(prices_df)}, Lookback: {LOOKBACK}, Trading bars: {len(prices_df) - LOOKBACK}")
 
     backtester = PortfolioBacktester(
         initial_capital=INITIAL_CAPITAL,
@@ -472,6 +504,8 @@ def main():
     )
 
     exit_log = []
+    refit_count = 0
+
     print("Starting backtest...")
     t0 = time.time()
 
@@ -485,6 +519,9 @@ def main():
         exit_log.extend(record["events"])
 
         bars_since_start = record["bars_since_start"]
+        if bars_since_start % REFIT_INTERVAL == 0:
+            refit_count += 1
+
         if bars_since_start > 0 and bars_since_start % (BARS_PER_DAY * 50) == 0:
             elapsed = time.time() - t0
             pct = bars_since_start / record["total_bars"] * 100
@@ -495,6 +532,7 @@ def main():
 
     elapsed = time.time() - t0
     print(f"\nBacktest complete in {elapsed:.1f}s")
+    print(f"Refits: {refit_count}")
 
     out_daily = os.path.join(script_dir, "backtest_intraday.csv")
     out_metrics = os.path.join(script_dir, "performance_metrics_intraday.csv")

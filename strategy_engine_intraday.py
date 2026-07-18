@@ -22,8 +22,8 @@ EXIT_THRESHOLD = 0.3
 NUM_SLOTS = 2
 SLOT_CAPITAL_FRAC = 0.5
 
-ENABLE_RANK_DROP_EXIT = True
-ENABLE_COINT_STABILITY_EXIT = True
+ENABLE_RANK_DROP_EXIT = False
+ENABLE_COINT_STABILITY_EXIT = False
 RANK_DROP_CONFIRMATIONS = 5
 COINT_STABILITY_CONFIRMATIONS = 2
 
@@ -151,14 +151,18 @@ class VECMStrategyEngine:
 
         self.risk_engine = dynamic_risk_engine(
             num_assets=self.N,
+            aum=initial_capital,
             gamma=0.05,
             entry_threshold=ENTRY_THRESHOLD,
             exit_threshold=EXIT_THRESHOLD,
+            short_exit_threshold=EXIT_THRESHOLD,
             long_exit_threshold=EXIT_THRESHOLD,
             turnover_penalty=0.0005,
             max_leverage=1.0,
             max_weight_per_asset=0.8,
             target_fraction=0.8,
+            volatility_threshold=0.50,
+            periods_per_year=PERIODS_PER_YEAR,
             max_entry_halflife=120,
             min_beta_confirmations=2,
             preempt_z_ratio=2.0,
