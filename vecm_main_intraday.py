@@ -30,7 +30,7 @@ SPREAD_WINDOW = 20 * BARS_PER_DAY
 REFIT_INTERVAL = BARS_PER_DAY
 
 NUM_SLOTS = 2
-SLOT_CAPITAL_FRAC = 0.5
+SLOT_CAPITAL_FRAC = 0.65
 
 ENABLE_RANK_DROP_EXIT = False
 ENABLE_COINT_STABILITY_EXIT = False
@@ -38,9 +38,8 @@ RANK_DROP_CONFIRMATIONS = 5
 COINT_STABILITY_CONFIRMATIONS = 2
 
 GAP_HOURS_THRESHOLD = 6.0
-
-MAKER_TAKER_FEE = 0.0005
 HALT_STALE_BARS = 2
+MAKER_TAKER_FEE = 0.0
 
 EARLY_CLOSE_MAX_SESSION_HOURS = 6.4
 EARLY_CLOSE_CALENDAR_START = "2015-01-01"
@@ -66,14 +65,6 @@ def _is_post_early_close(timestamp):
     if cutoff is None:
         return False
     return ts_et.time() > cutoff
-
-
-def _update_halt_state(stale_streak, p_prev, p_now, timestamp):
-    if _is_post_early_close(timestamp):
-        return np.zeros_like(stale_streak), np.zeros_like(stale_streak, dtype=bool)
-    stale_streak = np.where(p_now == p_prev, stale_streak + 1, 0)
-    halted_mask = stale_streak >= HALT_STALE_BARS
-    return stale_streak, halted_mask
 
 
 def _borrow_rates(assets, adv, vols):
@@ -141,6 +132,15 @@ def _gap_hours(ts_now, ts_prev):
         return 0.0
 
 
+def _update_halt_state(stale_streak, p_prev, p_now, timestamp):
+    if _is_post_early_close(timestamp):
+        return np.zeros_like(stale_streak), np.zeros_like(stale_streak, dtype=bool)
+    unchanged = np.isclose(p_now, p_prev, rtol=0.0, atol=1e-12)
+    stale_streak = np.where(unchanged, stale_streak + 1, 0)
+    halted_mask = stale_streak >= HALT_STALE_BARS
+    return stale_streak, halted_mask
+
+
 def _reset_slot(slot, N):
     slot["w"] = np.zeros(N)
     slot["holding_start"] = None
@@ -169,7 +169,7 @@ def _enter_slot(slot, sig, w_new, t, p_now):
     slot["_coint_break_streak"] = 0
 
 
-def generate_weight_trajectory(prices_df, adv_df, assets):
+def generate_weight_trajectory(prices_df, adv_df, assets, exit_log=None):
     prices_df = prices_df[assets]
     adv_df = adv_df[assets]
     returns_df = prices_df.pct_change().fillna(0)
@@ -199,7 +199,7 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
     risk_engine = dynamic_risk_engine(
         num_assets=N,
         aum=INITIAL_CAPITAL,
-        gamma=0.05,
+        gamma=0.025,
         entry_threshold=ENTRY_THRESHOLD,
         exit_threshold=EXIT_THRESHOLD,
         short_exit_threshold=EXIT_THRESHOLD,
@@ -220,8 +220,8 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
     )
 
     slots = [_new_slot(N) for _ in range(NUM_SLOTS)]
-    cached_signals = []
     stale_streak = np.zeros(N)
+    cached_signals = []
 
     for t in range(LOOKBACK, T):
         date = dates[t]
@@ -233,9 +233,8 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
         bars_since_start = t - LOOKBACK
         gap_hours = _gap_hours(date, dates[t - 1] if t > 0 else None)
         is_gap_bar = gap_hours >= GAP_HOURS_THRESHOLD
-        stale_streak, halted_mask = _update_halt_state(stale_streak, p_prev, p_now, date)
 
-        events = []
+        stale_streak, halted_mask = _update_halt_state(stale_streak, p_prev, p_now, date)
 
         if bars_since_start % REFIT_INTERVAL == 0 or not cached_signals:
             log_window = log_prices_all[t - LOOKBACK:t]
@@ -300,34 +299,33 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
         for slot in slots:
             slot["_was_flat"] = np.abs(slot["w"]).sum() < 0.01
 
-        slot_quality = {}
-
         cov_start = max(0, t - COV_WINDOW)
         cov_now = risk_engine.covariance_from_prices(prices_all[cov_start:t + 1])
+
+        slot_quality = {}
 
         for slot_idx, slot in enumerate(slots):
             gross_s = np.abs(slot["w"]).sum()
             if gross_s <= 0.01:
                 continue
 
-            held_idx = np.where(np.abs(slot["w"]) > 1e-6)[0]
-            if np.any(halted_mask[held_idx]):
-                frozen_mask = np.zeros(N, dtype=bool)
-                frozen_mask[held_idx[halted_mask[held_idx]]] = True
-                frozen_values = slot["w"].copy()
-                w_rehedged = risk_engine.optimize(
-                    np.zeros(N), cov_now, slot["w"],
-                    capital_frac=SLOT_CAPITAL_FRAC,
-                    frozen_mask=frozen_mask, frozen_values=frozen_values,
+            slot_halted = halted_mask & (np.abs(slot["w"]) > 1e-6)
+            if np.any(slot_halted):
+                direction = -np.sign(slot["entry_z"])
+                alpha_rehedge = direction * slot["active_beta"]
+                frozen_values = np.where(slot_halted, slot["w"], 0.0)
+                slot["w"] = risk_engine.optimize(
+                    alpha_rehedge, cov_now, slot["w"],
+                    adv=adv_now, vols=vol_now, capital_frac=gross_s,
+                    frozen_mask=slot_halted, frozen_values=frozen_values,
                 )
-                if np.abs(w_rehedged).sum() > 1e-6:
-                    slot["w"] = w_rehedged
-                events.append({
-                    "date": date, "slot": slot_idx, "event": "halt_rehedge", "reason": "asset_halted",
-                    "holding_bars": t - slot["holding_start"] if slot["holding_start"] is not None else 0,
-                    "pnl_since_entry": _slot_pnl(slot, p_now),
-                    "entry_z": slot.get("entry_z"), "exit_z": None,
-                })
+                if exit_log is not None:
+                    exit_log.append({
+                        "date": date, "slot": slot_idx, "event": "halt_rehedge", "reason": "asset_halted",
+                        "holding_bars": t - slot["holding_start"], "pnl_since_entry": _slot_pnl(slot, p_now),
+                        "entry_z": slot.get("entry_z"), "exit_z": None,
+                    })
+                continue
 
             holding_bars = t - slot["holding_start"]
             pnl_since_entry = _slot_pnl(slot, p_now)
@@ -353,11 +351,12 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
                 exit_reason = "gap_shock"
 
             if exit_reason is not None:
-                events.append({
-                    "date": date, "slot": slot_idx, "event": "exit", "reason": exit_reason,
-                    "holding_bars": holding_bars, "pnl_since_entry": pnl_since_entry,
-                    "entry_z": slot.get("entry_z"), "exit_z": z_slot,
-                })
+                if exit_log is not None:
+                    exit_log.append({
+                        "date": date, "slot": slot_idx, "event": "exit", "reason": exit_reason,
+                        "holding_bars": holding_bars, "pnl_since_entry": pnl_since_entry,
+                        "entry_z": slot.get("entry_z"), "exit_z": z_slot,
+                    })
                 _reset_slot(slot, N)
             else:
                 slot_quality[slot_idx] = {
@@ -379,8 +378,6 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
             for sig in live_signals:
                 sig_key = tuple(np.round(sig["beta_full"], 6))
                 if sig_key in used_signatures:
-                    continue
-                if np.any(np.abs(sig["beta_full"][halted_mask]) > 1e-8):
                     continue
                 alpha_candidate = risk_engine.compute_alpha([sig], N)
                 if np.abs(alpha_candidate).max() < 1e-10:
@@ -405,11 +402,12 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
                 sig, w_new, frac = chosen
                 _enter_slot(slot, sig, w_new, t, p_now)
                 used_signatures.add(tuple(np.round(sig["beta_full"], 6)))
-                events.append({
-                    "date": date, "slot": slot_idx, "event": "entry", "reason": "signal_entry",
-                    "holding_bars": 0, "pnl_since_entry": 0.0,
-                    "entry_z": sig["z"], "exit_z": None, "capital_frac": round(frac, 4),
-                })
+                if exit_log is not None:
+                    exit_log.append({
+                        "date": date, "slot": slot_idx, "event": "entry", "reason": "signal_entry",
+                        "holding_bars": 0, "pnl_since_entry": 0.0,
+                        "entry_z": sig["z"], "exit_z": None, "capital_frac": round(frac, 4),
+                    })
 
         all_full = sum(np.abs(slot["w"]).sum() > 0.01 for slot in slots) == NUM_SLOTS
         if all_full and slot_quality:
@@ -419,8 +417,6 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
             for sig in live_signals:
                 sig_key = tuple(np.round(sig["beta_full"], 6))
                 if sig_key in used_signatures:
-                    continue
-                if np.any(np.abs(sig["beta_full"][halted_mask]) > 1e-8):
                     continue
                 if not risk_engine.should_preempt(sig, weakest["score"], weakest["holding_bars"]):
                     continue
@@ -444,39 +440,31 @@ def generate_weight_trajectory(prices_df, adv_df, assets):
 
                 slot = slots[weakest_idx]
                 evicted_pnl = _slot_pnl(slot, p_now)
-                events.append({
-                    "date": date, "slot": weakest_idx, "event": "exit", "reason": "preempted",
-                    "holding_bars": weakest["holding_bars"], "pnl_since_entry": evicted_pnl,
-                    "entry_z": slot.get("entry_z"), "exit_z": weakest["z"],
-                })
+                if exit_log is not None:
+                    exit_log.append({
+                        "date": date, "slot": weakest_idx, "event": "exit", "reason": "preempted",
+                        "holding_bars": weakest["holding_bars"], "pnl_since_entry": evicted_pnl,
+                        "entry_z": slot.get("entry_z"), "exit_z": weakest["z"],
+                    })
 
                 _enter_slot(slot, sig, w_candidate, t, p_now)
                 used_signatures.add(sig_key)
-                events.append({
-                    "date": date, "slot": weakest_idx, "event": "entry", "reason": "preempt_entry",
-                    "holding_bars": 0, "pnl_since_entry": 0.0,
-                    "entry_z": sig["z"], "exit_z": None, "capital_frac": round(frac, 4),
-                })
+                if exit_log is not None:
+                    exit_log.append({
+                        "date": date, "slot": weakest_idx, "event": "entry", "reason": "preempt_entry",
+                        "holding_bars": 0, "pnl_since_entry": 0.0,
+                        "entry_z": sig["z"], "exit_z": None, "capital_frac": round(frac, 4),
+                    })
                 break
 
         total_w_new = sum((slot["w"] for slot in slots), np.zeros(N))
-
         borrow = _borrow_rates(assets, adv_now, vol_now)
 
         yield {
-            "date": date,
-            "w_prev": total_w_prev,
-            "w_new": total_w_new,
-            "prices_prev": p_prev,
-            "prices_new": p_now,
-            "adv": adv_now,
-            "vols": vol_now,
-            "z_score": z_primary,
-            "rank": rank_primary,
-            "borrow": borrow,
-            "events": events,
-            "bars_since_start": bars_since_start,
-            "total_bars": T - LOOKBACK,
+            "date": date, "w_prev": total_w_prev, "w_new": total_w_new,
+            "prices_prev": p_prev, "prices_new": p_now,
+            "adv": adv_now, "vols": vol_now,
+            "z_score": z_primary, "rank": rank_primary, "borrow": borrow,
         }
 
 
@@ -493,8 +481,9 @@ def main():
     if len(assets) < 2:
         raise ValueError("Need at least two available assets.")
 
+    T = len(prices_df)
     print(f"Assets: {assets}")
-    print(f"Total bars: {len(prices_df)}, Lookback: {LOOKBACK}, Trading bars: {len(prices_df) - LOOKBACK}")
+    print(f"Total bars: {T}, Lookback: {LOOKBACK}, Trading bars: {T - LOOKBACK}")
 
     backtester = PortfolioBacktester(
         initial_capital=INITIAL_CAPITAL,
@@ -504,35 +493,29 @@ def main():
     )
 
     exit_log = []
-    refit_count = 0
-
     print("Starting backtest...")
     t0 = time.time()
+    bars_done = 0
 
-    for record in generate_weight_trajectory(prices_df, adv_df, assets):
+    for record in generate_weight_trajectory(prices_df, adv_df, assets, exit_log=exit_log):
         backtester.process_day(
             record["date"], record["w_prev"], record["w_new"],
             record["prices_prev"], record["prices_new"],
             record["adv"], record["vols"],
             record["z_score"], record["rank"], record["borrow"],
         )
-        exit_log.extend(record["events"])
-
-        bars_since_start = record["bars_since_start"]
-        if bars_since_start % REFIT_INTERVAL == 0:
-            refit_count += 1
-
-        if bars_since_start > 0 and bars_since_start % (BARS_PER_DAY * 50) == 0:
+        bars_done += 1
+        if bars_done % (BARS_PER_DAY * 50) == 0:
             elapsed = time.time() - t0
-            pct = bars_since_start / record["total_bars"] * 100
-            print(f"  {pct:.0f}% done ({bars_since_start}/{record['total_bars']}) | "
+            pct = bars_done / (T - LOOKBACK) * 100
+            print(f"  {pct:.0f}% done ({bars_done}/{T - LOOKBACK}) | "
                   f"Capital: ${backtester.capital:,.0f} | "
                   f"Trades: {backtester.trade_count} | "
                   f"Time: {elapsed:.1f}s")
 
     elapsed = time.time() - t0
     print(f"\nBacktest complete in {elapsed:.1f}s")
-    print(f"Refits: {refit_count}")
+    print(f"Refits: {(T - LOOKBACK) // REFIT_INTERVAL + 1}")
 
     out_daily = os.path.join(script_dir, "backtest_intraday.csv")
     out_metrics = os.path.join(script_dir, "performance_metrics_intraday.csv")

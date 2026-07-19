@@ -4,7 +4,7 @@ import logging
 
 
 class dynamic_risk_engine:
-    def __init__(self, num_assets, aum, gamma=0.05,
+    def __init__(self, num_assets, aum, gamma=0.025,
                  entry_threshold=1.5,
                  exit_threshold=0.3,
                  short_exit_threshold=0.3,

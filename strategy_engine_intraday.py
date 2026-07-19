@@ -2,6 +2,7 @@ import asyncio
 import logging
 import numpy as np
 import pandas as pd
+import pandas_market_calendars as mcal
 from concurrent.futures import ThreadPoolExecutor
 
 from vecm_model_intraday import vecm
@@ -20,7 +21,7 @@ ENTRY_THRESHOLD = 1.7
 EXIT_THRESHOLD = 0.3
 
 NUM_SLOTS = 2
-SLOT_CAPITAL_FRAC = 0.5
+SLOT_CAPITAL_FRAC = 0.65
 
 ENABLE_RANK_DROP_EXIT = False
 ENABLE_COINT_STABILITY_EXIT = False
@@ -29,8 +30,33 @@ COINT_STABILITY_CONFIRMATIONS = 2
 
 GAP_HOURS_THRESHOLD = 6.0
 
-MAKER_TAKER_FEE = 0.0005
+MAKER_TAKER_FEE = 0.0
 HALT_STALE_BARS = 2
+
+EARLY_CLOSE_MAX_SESSION_HOURS = 6.4
+EARLY_CLOSE_CALENDAR_START = "2015-01-01"
+EARLY_CLOSE_CALENDAR_END = "2035-12-31"
+
+
+def _build_early_close_cutoffs():
+    nyse = mcal.get_calendar("NYSE")
+    sched = nyse.schedule(start_date=EARLY_CLOSE_CALENDAR_START, end_date=EARLY_CLOSE_CALENDAR_END)
+    session_hours = (sched["market_close"] - sched["market_open"]).dt.total_seconds() / 3600.0
+    early = sched[session_hours < EARLY_CLOSE_MAX_SESSION_HOURS]
+    close_et = early["market_close"].dt.tz_convert("US/Eastern")
+    return {ts.date(): ts.time() for ts in close_et}
+
+
+EARLY_CLOSE_CUTOFFS = _build_early_close_cutoffs()
+
+
+def _is_post_early_close(timestamp):
+    ts = pd.Timestamp(timestamp)
+    ts_et = ts.tz_convert("US/Eastern") if ts.tzinfo is not None else ts.tz_localize("UTC").tz_convert("US/Eastern")
+    cutoff = EARLY_CLOSE_CUTOFFS.get(ts_et.date())
+    if cutoff is None:
+        return False
+    return ts_et.time() > cutoff
 
 
 def _borrow_rates(assets, adv, vols, periods_per_year=PERIODS_PER_YEAR):
@@ -152,7 +178,7 @@ class VECMStrategyEngine:
         self.risk_engine = dynamic_risk_engine(
             num_assets=self.N,
             aum=initial_capital,
-            gamma=0.05,
+            gamma=0.025,
             entry_threshold=ENTRY_THRESHOLD,
             exit_threshold=EXIT_THRESHOLD,
             short_exit_threshold=EXIT_THRESHOLD,
@@ -195,13 +221,16 @@ class VECMStrategyEngine:
         is_gap_bar = gap_hours >= GAP_HOURS_THRESHOLD
         self._last_timestamp = timestamp
 
-        if len(self._historical_prices) > 1:
-            prev = self._historical_prices[-2]
-            self._stale_streak = np.where(current_prices == prev, self._stale_streak + 1, 0)
-        else:
+        if _is_post_early_close(timestamp):
             self._stale_streak = np.zeros(self.N)
-
-        halted_mask = self._stale_streak >= HALT_STALE_BARS
+            halted_mask = np.zeros(self.N, dtype=bool)
+        else:
+            if len(self._historical_prices) > 1:
+                prev = self._historical_prices[-2]
+                self._stale_streak = np.where(current_prices == prev, self._stale_streak + 1, 0)
+            else:
+                self._stale_streak = np.zeros(self.N)
+            halted_mask = self._stale_streak >= HALT_STALE_BARS
 
         if len(self._historical_prices) < LOOKBACK:
             return
@@ -289,18 +318,16 @@ class VECMStrategyEngine:
             if gross_s <= 0.01:
                 continue
 
-            held_idx = np.where(np.abs(s["w"]) > 1e-6)[0]
-            if np.any(halted_mask[held_idx]):
-                frozen_mask = np.zeros(self.N, dtype=bool)
-                frozen_mask[held_idx[halted_mask[held_idx]]] = True
-                frozen_values = s["w"].copy()
-                w_rehedged = self.risk_engine.optimize(
-                    np.zeros(self.N), cov_now, s["w"],
-                    capital_frac=SLOT_CAPITAL_FRAC,
-                    frozen_mask=frozen_mask, frozen_values=frozen_values,
+            slot_halted = halted_mask & (np.abs(s["w"]) > 1e-6)
+            if np.any(slot_halted):
+                direction = -np.sign(s["entry_z"])
+                alpha_rehedge = direction * s["active_beta"]
+                frozen_values = np.where(slot_halted, s["w"], 0.0)
+                s["w"] = self.risk_engine.optimize(
+                    alpha_rehedge, cov_now, s["w"],
+                    capital_frac=gross_s,
+                    frozen_mask=slot_halted, frozen_values=frozen_values,
                 )
-                if np.abs(w_rehedged).sum() > 1e-6:
-                    s["w"] = w_rehedged
                 self._trade_log.append({
                     "timestamp": timestamp, "slot": slot_idx, "event": "halt_rehedge",
                     "reason": "asset_halted",
@@ -308,6 +335,7 @@ class VECMStrategyEngine:
                     "pnl_since_entry": _slot_pnl(s, current_prices),
                     "entry_z": s.get("entry_z"), "exit_z": None,
                 })
+                continue
 
             holding_bars = t - s["holding_start"]
             pnl_since_entry = _slot_pnl(s, current_prices)
