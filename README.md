@@ -129,6 +129,124 @@ From the checked-in backtest run (2020–2025, six-asset universe, 15-minute bar
 | Metric | Value |
 |---|---|
 | Total bars | 38,991 |
+| Ending capital | $2,224,471.08 |
+| CAGR | 14.97% |
+| Sharpe | 0.8 |
+| Max drawdown | 14.70% |
+| Total trades | 242 |
+| Total frictions (impact + fees + borrow) | $177,032 |
+
+**Exit reason breakdown** (213 entries / 213 exits, plus 79 halt-driven rehedges that adjusted a position without fully closing it):
+
+| Reason | Count |
+|---|---|
+| `rank_dropped` — Johansen rank hit 0, confirmed | 99 |
+| `z_decay` — spread reverted, normal exit | 87 |
+| `cointegration_breakdown` — spread stability check failed | 22 |
+| `preempted` — evicted by a stronger signal | 5 |
+
+
+## Capacity
+
+Run `python3 capacity_analysis_intraday.py` to populate `capacity_analysis_intraday.csv` — it sweeps AUM from $1M to $10B against the fixed trade trajectory above and reports the level at which market impact erodes CAGR to zero.
+**Cointegration breakdown protocol.** On every refit, rank is re-tested for any asset currently held; `RANK_DROP_CONFIRMATIONS` consecutive zero-rank refits would force liquidation (`rank_dropped`). Independently, every bar checks whether the current spread value is a statistical outlier against its own trailing window (`check_cointegration_stability`); `COINT_STABILITY_CONFIRMATIONS` consecutive breaks would force liquidation (`cointegration_breakdown`). Both are currently disabled (`ENABLE_RANK_DROP_EXIT = False`, `ENABLE_COINT_STABILITY_EXIT = False`) — the machinery stays in the code so either can be re-enabled independently, but `z_decay` (the spread reverting back through `exit_threshold`) is the only exit path actually firing right now.
+
+**Look-ahead discipline.** Every refit uses `log_prices[t-LOOKBACK : t]` — strictly excluding the current bar. The current bar's own close is used for the entry/exit z-score and for sizing (`log_prices[... : t+1]`), which is a same-bar decide-and-execute assumption, not look-ahead: nothing computed from bar `t` is applied to a return that occurred before `t`. PnL accounting in `backtest_intraday.py` always charges `w_prev` — the weight decided at the previous bar — against the return realized this bar; a weight decided at `t` only starts earning P&L from `t → t+1`.
+
+---
+
+## Distributed Systems Design
+
+**Why pub/sub over point-to-point.** The live engine consumes market data as an independent stream from the strategy's decision loop, so a slow Johansen refit or a stalled CVXPY solve can't block the data feed from advancing. `broker_intraday.py` subscribes over ZeroMQ, buffers per-symbol until all six tickers for a timestamp have arrived, then emits one synchronized six-asset snapshot — this sync-by-full-timestamp (not by date) was a deliberate fix after an earlier version collapsed all of a day's intraday bars onto a single key.
+
+**Dynamic risk & hedging — trading halts and hard-to-borrow.** There's no explicit halt flag in the data, but `data_prep_intraday.py` forward-fills any missing print, so a halted or untraded asset shows up as bit-for-bit identical consecutive closes — a real, checkable signal, not a synthetic one (the sample data has 19–39 such 2+-bar events per asset). `HALT_STALE_BARS` consecutive identical closes flags an asset as halted — except on NYSE early-close sessions (day before Thanksgiving, July 3rd, Christmas Eve), where the last bars of a half day would otherwise look identical to a halt simply because trading ended at 1pm ET; `pandas_market_calendars` builds the actual early-close cutoffs once at startup, and any bar timestamped after that cutoff resets the stale streak instead of accumulating it. Any active slot touching a genuinely halted asset gets rehedged before the normal exit checks run: `risk_intraday.optimize()` takes a `frozen_mask` / `frozen_values` pair that pins the halted asset's weight via an equality constraint while the convex solver reoptimizes the remaining N−1 assets' weights against it — recalculating the free legs to minimize risk against a position it can no longer trade. New entries and slot preemptions independently skip any signal whose beta touches a currently-halted asset. Hard-to-borrow cost is modeled continuously rather than as a binary flag: `_borrow_rates()` scales each asset's borrow rate by its own liquidity stress (ADV deviation from its trailing median) and volatility stress, so a stock that's getting expensive to borrow before a halt already carries that cost, not just after.
+
+**Capital allocation across signals.** Two concurrent position slots (`NUM_SLOTS = 2`), each budgeted `SLOT_CAPITAL_FRAC = 0.5` of gross leverage. This was set empirically, not arbitrarily — an earlier multi-leg concurrent-trading variant that tried to run more simultaneous positions degraded performance, because the six bank stocks are highly cross-correlated (pairwise correlations ~0.73–0.86 in this sample), so additional "diversifying" slots were really just re-expressing the same systematic risk. A weaker open slot can be preempted by a materially stronger incoming signal (`should_preempt`, gated on both a z-score ratio and a minimum holding period, so a slot can't be evicted the bar after it opens).
+
+---
+
+## Microstructure-Aware Cost Model
+
+`backtest_intraday.py`'s `PortfolioBacktester` charges three separate frictions every bar:
+
+| Cost | Model | Note |
+|---|---|---|
+| Market impact | Square-root impact — `gamma · vol · sqrt(participation) · notional`, `participation = notional / ADV` | scales convexly, not linearly, with trade size relative to liquidity |
+| Trading fees | `MAKER_TAKER_FEE = 0.0005` (5 bps) on notional traded, one-way | blended approximation of exchange taker fees at this price range |
+| Borrow cost | Per-asset annualized short rate, stressed by liquidity and volatility (see above) | charged only against short exposure, every bar |
+
+None of these are optional or togglable per-run — they're always in the accounting, which is why the tear sheet below is meaningfully lower than an earlier zero-fee version of this backtest.
+
+---
+
+## Repository Structure
+
+| File | Role |
+|---|---|
+| `vecm_model_intraday.py` | Johansen test, VECM β/half-life extraction, RSI/MACD, rolling z-score |
+| `risk_intraday.py` | `dynamic_risk_engine` — convex position sizing, halt-aware N−1 rehedging, conviction sizing, slot preemption |
+| `backtest_intraday.py` | `PortfolioBacktester` — P&L accounting, market impact, fees, borrow cost, drawdown/Sharpe |
+| `vecm_main_intraday.py` | Batch backtest entry point; `generate_weight_trajectory()` is the shared decision-loop generator |
+| `strategy_engine_intraday.py` | `VECMStrategyEngine` — the live, tick-driven counterpart, same signal/risk core |
+| `capacity_analysis_intraday.py` | AUM sweep against the fixed trade trajectory — finds where market impact erodes CAGR to zero |
+| `broker_intraday.py` | ZeroMQ `SUB` — synchronizes six independent ticker streams by timestamp |
+| `data_intraday.py` | ZeroMQ `PUB` — replays historical bars as a simulated live feed |
+| `data_prep_intraday.py` | Split-adjustment, rolling dollar-ADV construction |
+| `clean_rth.py` | Regular-trading-hours filter, forward-fill of data gaps |
+| `report_intraday.py`, `plot_graph.py` | Tear sheet and position-visualization plotting |
+| `run_publisher_intraday.py`, `run_strategy_intraday.py` | Process entry points for the live simulation |
+| `sample_prices_intraday.csv`, `sample_dollar_adv_intraday.csv` | Checked-in, cleaned 15-min data for the six-asset universe, 2020–2025 — the backtest runs directly off these |
+
+---
+
+## Setup & Reproduction
+
+```bash
+pip install -r requirements.txt
+```
+
+**Reproducibility note:** the script that pulls raw bars from Alpaca isn't checked into this repo, since it needs API credentials — but `sample_prices_intraday.csv` and `sample_dollar_adv_intraday.csv` are, so the backtest runs out of the box without needing to regenerate them.
+
+Run the backtest:
+
+```bash
+python3 vecm_main_intraday.py
+```
+
+Produces `backtest_intraday.csv` (per-bar P&L), `performance_metrics_intraday.csv` (tear sheet), and `exit_reasons_intraday.csv` (every entry/exit/rehedge event with its trigger reason).
+
+Run the capacity sweep (reuses the same trade trajectory computed once, so it's a single extra pass of accounting, not a re-run of signal generation, per AUM level):
+
+```bash
+python3 capacity_analysis_intraday.py
+```
+
+Produces `capacity_analysis_intraday.csv` and a CAGR/Sharpe-vs-AUM plot, and prints the AUM at which CAGR crosses zero.
+
+Run the live simulation (two separate processes, ZeroMQ pub/sub between them):
+
+```bash
+python3 run_publisher_intraday.py   # terminal 1
+python3 run_strategy_intraday.py    # terminal 2
+```
+
+Visualize positions:
+
+```bash
+python3 plot_graph.py
+```
+
+---
+
+## Performance
+
+From the checked-in backtest run (2020–2025, six-asset universe, 15-minute bars, $1M starting capital):
+
+*This snapshot predates disabling `rank_dropped`/`cointegration_breakdown` as exit paths (`ENABLE_RANK_DROP_EXIT`/`ENABLE_COINT_STABILITY_EXIT` are now `False`, `z_decay` is the only exit firing) — re-run `vecm_main_intraday.py` to regenerate it against the current strategy before citing these numbers.*
+
+| Metric | Value |
+|---|---|
+| Total bars | 38,991 |
 | Ending capital | $1,640,289 |
 | CAGR | 9.02% |
 | Sharpe | 0.49 |
