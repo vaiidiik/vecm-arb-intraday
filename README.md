@@ -253,14 +253,6 @@ From the checked-in backtest run (2020–2025, six-asset universe, 15-minute bar
 | Total trades | 353 |
 | Total frictions (impact + fees + borrow) | $177,032 |
 
-**Exit reason breakdown** (213 entries / 213 exits, plus 79 halt-driven rehedges that adjusted a position without fully closing it):
-
-| Reason | Count |
-|---|---|
-| `rank_dropped` — Johansen rank hit 0, confirmed | 99 |
-| `z_decay` — spread reverted, normal exit | 87 |
-| `cointegration_breakdown` — spread stability check failed | 22 |
-| `preempted` — evicted by a stronger signal | 5 |
 
 The dominant constraint on this strategy is signal scarcity, not exit logic or sizing — average gross exposure sits at 28%, meaning the book is flat roughly three-quarters of the time. Widening `entry_threshold` or adding slots increases trade count but degrades risk-adjusted returns, because the six-asset universe is too internally correlated (pairwise correlation 0.73–0.86) to support genuinely independent concurrent positions — this was tested and reverted, not assumed.
 
