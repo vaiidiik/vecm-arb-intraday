@@ -75,7 +75,7 @@ None of these are optional or togglable per-run — they're always in the accoun
 | `data_intraday.py` | ZeroMQ `PUB` — replays historical bars as a simulated live feed |
 | `data_prep_intraday.py` | Split-adjustment, rolling dollar-ADV construction |
 | `clean_rth.py` | Regular-trading-hours filter, forward-fill of data gaps |
-| `report_intraday.py`, `plot_graph.py` | Tear sheet and position-visualization plotting |
+| `report_intraday.py` | Tear sheet |
 | `run_publisher_intraday.py`, `run_strategy_intraday.py` | Process entry points for the live simulation |
 | `sample_prices_intraday.csv`, `sample_dollar_adv_intraday.csv` | Checked-in, cleaned 15-min data for the six-asset universe, 2020–2025 — the backtest runs directly off these |
 
@@ -112,11 +112,7 @@ python3 run_publisher_intraday.py   # terminal 1
 python3 run_strategy_intraday.py    # terminal 2
 ```
 
-Visualize positions:
 
-```bash
-python3 plot_graph.py
-```
 
 ---
 
