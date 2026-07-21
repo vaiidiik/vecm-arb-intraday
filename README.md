@@ -129,17 +129,17 @@ From the checked-in backtest run (2020–2025, six-asset universe, 15-minute bar
 | Metric | Value |
 |---|---|
 | Total bars | 38,991 |
-| Ending capital | $1,640,289 |
-| CAGR | 9.02% |
-| Sharpe | 0.49 |
-| Max drawdown | 17.94% |
-| Annualized volatility | 10.5% |
-| Avg. gross exposure | 28.1% |
-| Avg. turnover / bar | 0.58% |
-| Total trades | 353 |
-| Total frictions (impact + fees + borrow) | $177,032 |
+| Ending capital | $2,120,782.52 |
+| CAGR | 14.02% |
+| Sharpe | 0.74 |
+| Max drawdown | 14.70% |
+| Annualized volatility | 13.5% |
+| Avg. gross exposure | 53.21% |
+| Avg. turnover / bar | 0.49% |
+| Total trades | 242 |
+| Total frictions (impact + fees + borrow) | $99,141.63 |
 
-The dominant constraint on this strategy is signal scarcity, not exit logic or sizing — average gross exposure sits at 28%, meaning the book is flat roughly three-quarters of the time. Widening `entry_threshold` or adding slots increases trade count but degrades risk-adjusted returns, because the six-asset universe is too internally correlated (pairwise correlation 0.73–0.86) to support genuinely independent concurrent positions — this was tested and reverted, not assumed.
+Widening `entry_threshold` or adding slots increases trade count but degrades risk-adjusted returns, because the six-asset universe is too internally correlated (pairwise correlation 0.73–0.86) to support genuinely independent concurrent positions — this was tested and reverted, not assumed.
 
 ---
 
