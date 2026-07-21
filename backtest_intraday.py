@@ -22,23 +22,7 @@ class PortfolioBacktester:
         self.entry_day = {}
         self.position_pnl = {}
         self.trade_count = 0
-        self.trade_log = []
-
-                                                               
-                                                                           
-                                                                    
-                                                                         
-                                                                          
-                                                                           
-                                                                       
-                                                                           
-                                                                           
-                                                                          
-                                                                           
-                                                                      
-                                                                       
-                                                                    
-                                                                        
+        self.trade_log = []                                                           
         self.risk_free_rate = risk_free_rate
         self.credit_idle_cash = credit_idle_cash
 
@@ -90,20 +74,7 @@ class PortfolioBacktester:
 
         notional_traded = self.capital * np.sum(np.abs(delta_w))
         base_fees = float(notional_traded * self.fee_rate) if turnover > 1e-6 else 0.0
-
-                                                                  
-                                                                          
-                                                                        
-                                                                           
-                                                                      
-                                                                         
-                                                                          
-                                                                     
-                                                                      
-                                                                     
-                                                                           
-                                                                       
-                                                                        
+                                                       
         notional_traded_per_asset = self.capital * np.abs(delta_w)
         if turnover > 1e-6 and self.gamma > 0:
             safe_adv = np.where(adv > 1e-6, adv, 1.0)

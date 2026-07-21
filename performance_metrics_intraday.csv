@@ -1,11 +1,11 @@
 metric,value
 total_bars,38991
-ending_capital,2224471.08
-cagr,14.97%
+ending_capital,2120782.52
+cagr,14.02%
 max_dd,14.70%
-sharpe,0.8
-volatility,0.1357
+sharpe,0.74
+volatility,0.1356
 avg_turnover,0.0049
 avg_exposure,0.5321
 total_trades,242
-total_fees,177032
+total_fees,99141.63

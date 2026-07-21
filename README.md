@@ -54,7 +54,7 @@ Both paths call into the same `vecm_model_intraday.py` (signal generation) and `
 | Cost | Model | Note |
 |---|---|---|
 | Market impact | Square-root impact — `gamma · vol · sqrt(participation) · notional`, `participation = notional / ADV` | scales convexly, not linearly, with trade size relative to liquidity |
-| Trading fees | `MAKER_TAKER_FEE = 0.0005` (5 bps) on notional traded, one-way | blended approximation of exchange taker fees at this price range |
+| Trading fees | `MAKER_TAKER_FEE = 0.00025` (2.5 bps) on notional traded, one-way | blended approximation of exchange taker fees at this price range |
 | Borrow cost | Per-asset annualized short rate, stressed by liquidity and volatility (see above) | charged only against short exposure, every bar |
 
 None of these are optional or togglable per-run — they're always in the accounting, which is why the tear sheet below is meaningfully lower than an earlier zero-fee version of this backtest.
